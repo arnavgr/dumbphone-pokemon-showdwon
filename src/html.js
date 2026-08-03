@@ -1,10 +1,3 @@
-// Every page here is plain server-rendered HTML: no client-side JS, no CSS
-// beyond a few inline tweaks, and every action is a plain <a> link or tiny
-// form so it works with CloudPhone's keypad + number-select navigation
-// (same approach as the dumbphone chess site).
-
-// Show your own active Pokemon from behind (like the real games).
-// Set false to always show front sprites (saves one fallback tier).
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
 function esc(s) {
@@ -70,7 +63,6 @@ function hpBar(cond) {
   return `<div class="hpbar"><div class="hpfill" style="width:${pct}%;background:${color}"></div></div><small>${pct}%${status}</small>`;
 }
 
-// Which slot(s) belong to "me" vs "opponent", based on detected side.
 function activeForSide(state, which) {
   const mySide = state.mySide || "p1";
   const side = which === "my" ? mySide : mySide === "p1" ? "p2" : "p1";
@@ -290,8 +282,6 @@ export function renderBattle(state) {
 <a href="/">Home</a>
 </p>`;
 
-  // Auto-refresh only while waiting; never while a choice menu is on screen
-  // (a reload would reset keypad focus).
   const refresh = state.request ? 0 : 7;
 
   return page(state.roomTitle || "Battle", body, refresh);

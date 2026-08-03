@@ -1,18 +1,3 @@
-// Minimal parser/formatter for Pokemon Showdown's line protocol.
-// Reference: https://github.com/smogon/pokemon-showdown/blob/master/PROTOCOL.md
-//            https://github.com/smogon/pokemon-showdown/blob/master/sim/SIM-PROTOCOL.md
-//
-// This does NOT try to cover every message type -- only what's needed to
-// show a legible battle log and drive the choice UI on a feature phone.
-// Anything unrecognized falls back to a raw "[type] rest" line instead of
-// being silently dropped, so nothing important gets lost.
-
-// Splits one raw WebSocket text frame into { roomId, lines }.
-// Frames look like:
-//    >roomid
-//    |line1
-//    |line2
-// or, for global/lobby messages, the ">roomid" line is omitted.
 export function splitFrame(text) {
   const rawLines = String(text || "").split("\n");
 
@@ -27,7 +12,6 @@ export function splitFrame(text) {
   return { roomId, lines: lines.filter((l) => l.length > 0) };
 }
 
-// A single protocol line -> { type, parts }.
 export function parseLine(line) {
   if (!line.startsWith("|")) {
     return { type: "raw", parts: [line] };
@@ -37,26 +21,22 @@ export function parseLine(line) {
   return { type, parts };
 }
 
-// "p1a: Pikachu" -> { side: "p1a", name: "Pikachu" }
 export function parseIdent(ident) {
   const idx = ident.indexOf(": ");
   if (idx === -1) return { side: ident, name: ident };
   return { side: ident.slice(0, idx), name: ident.slice(idx + 2) };
 }
 
-// "78/100 par" or "0 fnt" -> readable condition text
 function condText(cond) {
   if (!cond) return "";
   if (cond === "0 fnt") return "fainted";
   return cond;
 }
 
-// Normalizes a Showdown username for comparison ("Guest 1234" -> "guest1234").
 export function normalizeName(name) {
   return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-// "Pikachu, L50, M, shiny" -> { species: "Pikachu", shiny: true }
 export function parseDetails(details) {
   const parts = String(details || "")
     .split(",")
@@ -69,11 +49,6 @@ export function parseDetails(details) {
   return { species, shiny };
 }
 
-// Converts a species/form name into a Showdown sprite file id.
-//   "Mr. Mime"      -> "mrmime"
-//   "Pikachu-Alola" -> "pikachu-alola"
-//   "Ho-Oh"         -> "ho-oh"
-//   "Nidoran♀"      -> "nidoranf"
 export function spriteId(species) {
   let s = String(species || "").toLowerCase().trim();
   if (!s) return "";
@@ -95,9 +70,6 @@ export function spriteId(species) {
   return s.replace(/[^a-z0-9]/g, "");
 }
 
-// Same-origin sprite URL served by the Worker's /sprite/* proxy.
-//   anim=false -> gen5 / gen5-back (.png)
-//   anim=true  -> gen5ani / gen5ani-back (.gif, animated, higher quality)
 export function spriteUrl(species, { shiny = false, back = false, anim = false } = {}) {
   const id = spriteId(species);
   if (!id) return null;
@@ -111,9 +83,6 @@ export function spriteUrl(species, { shiny = false, back = false, anim = false }
   return `/sprite/${folder}/${file}.${ext}`;
 }
 
-// Turns one parsed battle-log line into a human readable string, or null
-// if it should be skipped entirely (chat/join/leave/timer noise etc).
-// `mySide` ("p1"/"p2"/null) controls "Your" vs "Opponent's" wording.
 export function formatBattleLine(type, parts, mySide = null) {
   const mine = (side) =>
     mySide ? side.startsWith(mySide) : side.startsWith("p1");
@@ -146,6 +115,10 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "html":
     case "uhtml":
     case "uhtmlchange":
+    case "formats":
+    case "customgroups":
+    case "updateuser":
+    case "challstr":
       return null;
 
     case "tier":
@@ -247,7 +220,6 @@ export function formatBattleLine(type, parts, mySide = null) {
       return parts[0];
 
     default:
-      // Fallback so nothing silently disappears -- useful for debugging too.
       return parts.length ? `[${type}] ${parts.join(" ")}` : null;
   }
 }

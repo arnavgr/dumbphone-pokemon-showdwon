@@ -10,17 +10,6 @@ function getCookie(request, name) {
 // ---------------------------------------------------------------------------
 // Same-origin sprite proxy (/sprite/*)
 // ---------------------------------------------------------------------------
-// Feature phones and CloudPhone get images from our own origin; the Worker
-// fetches the real asset from Pokemon Showdown's sprite CDN (with a GitHub
-// raw fallback) and caches it at the edge.
-//
-// Supports both static .png sets (gen5, gen5-back) and animated .gif sets
-// (gen5ani, gen5ani-back), with graceful degradation chains:
-//   gen5ani-back -> gen5-back -> gen5ani -> gen5
-//   gen5ani      -> gen5
-//   gen5-back    -> gen5
-// and, within each folder, "form/shiny" files fall back to the base species.
-
 const FOLDER_EXT = {
   gen5: ".png",
   "gen5-back": ".png",
@@ -44,19 +33,18 @@ function spriteCandidates(path) {
 
   const extMatch = file.match(/\.(png|gif)$/i);
   const ext = extMatch ? extMatch[0] : ".png";
-  const stem = file.slice(0, file.length - ext.length); // e.g. "pikachu-alola-shiny"
-  const baseStem = stem.split("-")[0];                  // e.g. "pikachu"
+  const stem = file.slice(0, file.length - ext.length);
+  const baseStem = stem.split("-")[0];
 
   const folderChain = [folder, ...(FOLDER_FALLBACK[folder] || [])];
 
   const candidates = [];
   for (const f of folderChain) {
-    const e = FOLDER_EXT[f] || ext; // swap .gif <-> .png when crossing folder types
+    const e = FOLDER_EXT[f] || ext;
     candidates.push(`${f}/${stem}${e}`);
     if (baseStem !== stem) candidates.push(`${f}/${baseStem}${e}`);
   }
 
-  // de-dupe, preserve order
   return [...new Set(candidates)];
 }
 
@@ -67,7 +55,6 @@ async function handleSprite(request, url) {
 
   const path = decodeURIComponent(url.pathname.slice("/sprite/".length));
 
-  // Allow .png AND .gif; block traversal / query strings; keep it a plain path.
   if (!path || /[?#]/.test(path) || !/^[a-z0-9-_/]+\.(png|gif)$/i.test(path)) {
     return new Response("Not found", { status: 404 });
   }
@@ -78,7 +65,7 @@ async function handleSprite(request, url) {
     const cached = await caches.default.match(cacheKey);
     if (cached) return cached;
   } catch {
-    // Cache unavailable -- fall through to network.
+    // Cache unavailable
   }
 
   const sources = [
@@ -96,14 +83,11 @@ async function handleSprite(request, url) {
           headers: { "User-Agent": "ps-cloudphone-sprite-proxy" },
         });
       } catch {
-        continue; // network error -> try next source
+        continue;
       }
 
       if (!upstream.ok) continue;
 
-      // Rebuild with a CLEAN header set. Do NOT copy upstream headers:
-      // Workers already decompressed the body, so content-encoding /
-      // content-length would be wrong, and Set-Cookie must not leak.
       const headers = new Headers();
       headers.set(
         "content-type",
@@ -117,7 +101,7 @@ async function handleSprite(request, url) {
       try {
         await caches.default.put(cacheKey, response.clone());
       } catch {
-        // Ignore cache put failures.
+        // Ignore cache put failures
       }
 
       return response;
@@ -128,14 +112,12 @@ async function handleSprite(request, url) {
 }
 
 // ---------------------------------------------------------------------------
-// Main Worker entry: session cookie + routing to the per-session DO.
+// Main Worker entry
 // ---------------------------------------------------------------------------
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Sprite proxy lives outside the DO (stateless, edge-cached).
     if (url.pathname.startsWith("/sprite/")) {
       return handleSprite(request, url);
     }
@@ -145,8 +127,6 @@ export default {
 
     if (!sid) {
       sid = crypto.randomUUID();
-      // No Secure flag: some feature-phone browsers proxy through http
-      // internally even when the address bar shows https.
       setCookie = `sid=${sid}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`;
     }
 

@@ -16,23 +16,16 @@ import {
   renderTeam,
 } from "./html.js";
 
-// Real Pokemon Showdown server, per PROTOCOL.md.
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
-
-// Animated (gif) sprites look much nicer; set false for extremely
-// low-bandwidth phones to use the static gen5 png sets instead.
 const ANIMATED_SPRITES = true;
 
 const DEFAULT_STATE = {
   connected: false,
   username: null,
   loggedIn: false,
-
-  // Side detection: NEVER assume p1 == you.
-  mySide: null, // "p1" | "p2" | null
-  players: {},  // { p1: "Name", p2: "Name" }
-  active: {},   // { p1a: {...}, p1b: {...}, p2a: {...} }
-
+  mySide: null, 
+  players: {},  
+  active: {},   
   roomId: null,
   roomTitle: null,
   log: [],
@@ -41,11 +34,11 @@ const DEFAULT_STATE = {
   turn: 0,
   ended: false,
   resultMsg: null,
-
   challstr: null,
   team: "",
   notice: null,
   loginError: null,
+  upstreamCookie: null, // Used to preserve the Showdown session
 };
 
 export class BattleSession extends DurableObject {
@@ -55,6 +48,7 @@ export class BattleSession extends DurableObject {
     this.env = env;
     this.ws = null;
     this.state_ = null;
+    this.keepAliveInterval = null;
 
     this.ctx.blockConcurrencyWhile(async () => {
       const saved = await this.ctx.storage.get("state");
@@ -91,8 +85,6 @@ export class BattleSession extends DurableObject {
     });
   }
 
-  // Figure out whether we are p1 or p2 by matching |player| names against
-  // our own username. Called whenever either piece of info changes.
   detectMySide() {
     if (!this.state_.username) return;
     const mine = normalizeName(this.state_.username);
@@ -105,7 +97,6 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  // |switch| / |drag| -> store the active Pokemon under its slot (p1a etc).
   upsertActive(parts) {
     const p = parseIdent(parts[0] || "");
     const { species, shiny } = parseDetails(parts[1] || "");
@@ -133,10 +124,8 @@ export class BattleSession extends DurableObject {
     return new URLSearchParams(text);
   }
 
-  // ---- Login (challstr -> action.php -> /trn) -------------------------------
   async login(username, password) {
     if (!this.state_.challstr) {
-      // Give the socket a moment to deliver challstr.
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
     if (!this.state_.challstr) {
@@ -157,7 +146,7 @@ export class BattleSession extends DurableObject {
 
     const text = await res.text();
     let jsonText = text.trim();
-    if (jsonText.startsWith("]")) jsonText = jsonText.slice(1); // Showdown JSON prefix
+    if (jsonText.startsWith("]")) jsonText = jsonText.slice(1);
 
     let data;
     try {
@@ -186,38 +175,47 @@ export class BattleSession extends DurableObject {
     this.state_.notice = "Logged in.";
   }
 
-  // ---- Outbound WebSocket lifecycle ----------------------------------------
-  // Lazily open (or re-open) the outbound WebSocket to the real Showdown
-  // server. This is a client connection the DO initiates via fetch(), not a
-  // connection accepted from an incoming request -- so it does NOT use the
-  // Hibernatable WebSockets API (ctx.acceptWebSocket only applies to sockets
-  // a DO accepts from an Upgrade request it receives; outbound sockets aren't
-  // hibernatable yet -- see cloudflare/workerd#4864).
-  // Practically: this DO stays pinned in memory (billed) while this socket is
-  // open, and gets evicted -- closing the socket -- after ~70-140s with no
-  // incoming HTTP request. A page left idle that long will need to reconnect
-  // on the next tap (the /reconnect route and the challstr rejoin help).
   async ensureConnected() {
     if (this.ws && this.ws.readyState === 1 /* OPEN */) {
       return;
     }
 
-    const resp = await fetch(SHOWDOWN_WS_URL, {
-      headers: { Upgrade: "websocket" },
-    });
+    const headers = new Headers({ Upgrade: "websocket" });
+    
+    if (this.state_.upstreamCookie) {
+      headers.set("Cookie", this.state_.upstreamCookie);
+    }
+
+    const resp = await fetch(SHOWDOWN_WS_URL, { headers });
     const ws = resp.webSocket;
     if (!ws) {
       throw new Error("Showdown server did not accept the WebSocket upgrade");
     }
 
+    const setCookie = resp.headers.get("Set-Cookie");
+    if (setCookie) {
+      const match = setCookie.match(/(sid=[^;]+)/);
+      if (match) this.state_.upstreamCookie = match[1];
+    }
+
     ws.accept();
+    
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    this.keepAliveInterval = setInterval(() => {
+      try {
+        if (this.ws && this.ws.readyState === 1) this.ws.send(""); 
+      } catch {}
+    }, 45000); 
+
     ws.addEventListener("message", (event) => {
       this.ctx.waitUntil(this.onSocketMessage(event.data));
     });
     ws.addEventListener("close", (event) => {
+      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
       this.ctx.waitUntil(this.onSocketClose(event));
     });
     ws.addEventListener("error", () => {
+      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
       this.ctx.waitUntil(this.onSocketError());
     });
 
@@ -259,7 +257,6 @@ export class BattleSession extends DurableObject {
     await this.save();
   }
 
-  // ---- Protocol handling ----------------------------------------------------
   async handleLine(roomId, rawLine) {
     const { type, parts } = parseLine(rawLine);
     const mySide = this.state_.mySide;
@@ -268,11 +265,10 @@ export class BattleSession extends DurableObject {
       case "challstr": {
         this.state_.challstr = parts.join("|");
         this.state_.connected = true;
-        // After a (re)connect, try to rejoin a battle room we had before.
         if (this.state_.roomId && !this.state_.ended) {
           try {
             this.sendToRoom(this.state_.roomId, `/join ${this.state_.roomId}`);
-          } catch { /* socket not ready yet; ignore */ }
+          } catch { }
         }
         break;
       }
@@ -307,7 +303,7 @@ export class BattleSession extends DurableObject {
               this.sendToRoom(ids[0], "/join " + ids[0]);
             }
           }
-        } catch { /* ignore malformed json */ }
+        } catch { }
         break;
       }
 
@@ -321,16 +317,13 @@ export class BattleSession extends DurableObject {
         if (!parts[0]) { this.state_.request = null; break; }
         try {
           const req = JSON.parse(parts[0]);
-
-          // Belt-and-braces side detection straight from the request JSON.
           const side = String(
             req?.side?.id || req?.side?.pokemon?.[0]?.ident || ""
           ).slice(0, 2);
           if (side === "p1" || side === "p2") this.state_.mySide = side;
 
           this.state_.request = req;
-          // Team preview is now handled by the /lead UI (no auto-submit).
-        } catch { /* ignore malformed json */ }
+        } catch { }
         break;
       }
 
@@ -397,12 +390,11 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  // ---- HTTP surface ----------------------------------------------------------
   htmlResponse(body) {
     return new Response(body, {
       headers: {
         "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store", // feature-phone proxies love stale pages
+        "cache-control": "no-store", 
       },
     });
   }
@@ -448,7 +440,7 @@ export class BattleSession extends DurableObject {
             this.state_.roomId,
             `/choose ${value}${rqid !== undefined ? "|" + rqid : ""}`
           );
-          this.state_.request = null; // UI shows "waiting" until next request
+          this.state_.request = null; 
           await this.save();
         }
         return Response.redirect(new URL("/battle", url), 302);
@@ -528,7 +520,6 @@ export class BattleSession extends DurableObject {
         if (request.method === "POST") {
           const params = await this.readForm(request);
           const team = params.get("team") || "";
-          // Packed teams are single-line.
           this.state_.team = team.replace(/\r?\n/g, "").trim();
           this.state_.notice = "Team saved.";
           await this.save();
@@ -544,7 +535,6 @@ export class BattleSession extends DurableObject {
         return this.htmlResponse(renderBattle(this.state_));
       }
 
-      // default: home
       return this.htmlResponse(renderHome(this.state_));
     } catch (err) {
       return new Response(renderError(err.message || String(err)), {
