@@ -9,22 +9,25 @@
 
 // Splits one raw WebSocket text frame into { roomId, lines }.
 // Frames look like:
-//   >roomid
-//   |line1
-//   |line2
+//    >roomid
+//    |line1
+//    |line2
 // or, for global/lobby messages, the ">roomid" line is omitted.
 export function splitFrame(text) {
-  const rawLines = text.split("\n");
+  const rawLines = String(text || "").split("\n");
+
   let roomId = "";
   let lines = rawLines;
+
   if (rawLines[0] && rawLines[0].startsWith(">")) {
     roomId = rawLines[0].slice(1).trim();
     lines = rawLines.slice(1);
   }
+
   return { roomId, lines: lines.filter((l) => l.length > 0) };
 }
 
-// A single protocol line -> { type, parts } or null for plain text lines.
+// A single protocol line -> { type, parts }.
 export function parseLine(line) {
   if (!line.startsWith("|")) {
     return { type: "raw", parts: [line] };
@@ -48,34 +51,84 @@ function condText(cond) {
   return cond;
 }
 
+// Normalizes a Showdown username for comparison ("Guest 1234" -> "guest1234").
+export function normalizeName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// "Pikachu, L50, M, shiny" -> { species: "Pikachu", shiny: true }
+export function parseDetails(details) {
+  const parts = String(details || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const species = parts[0] || "";
+  const shiny = parts.some((p) => p.toLowerCase() === "shiny");
+
+  return { species, shiny };
+}
+
+// Converts a species/form name into a Showdown sprite file id.
+//   "Mr. Mime"      -> "mrmime"
+//   "Pikachu-Alola" -> "pikachu-alola"
+//   "Ho-Oh"         -> "ho-oh"
+//   "Nidoran♀"      -> "nidoranf"
+export function spriteId(species) {
+  let s = String(species || "").toLowerCase().trim();
+  if (!s) return "";
+
+  s = s
+    .replace(/♀/g, "f")
+    .replace(/♂/g, "m")
+    .replace(/'/g, "")
+    .replace(/\./g, "");
+
+  if (s.includes("-")) {
+    return s
+      .split("-")
+      .map((part) => part.replace(/[^a-z0-9]/g, ""))
+      .filter(Boolean)
+      .join("-");
+  }
+
+  return s.replace(/[^a-z0-9]/g, "");
+}
+
+// Same-origin sprite URL served by the Worker's /sprite/* proxy.
+//   anim=false -> gen5 / gen5-back (.png)
+//   anim=true  -> gen5ani / gen5ani-back (.gif, animated, higher quality)
+export function spriteUrl(species, { shiny = false, back = false, anim = false } = {}) {
+  const id = spriteId(species);
+  if (!id) return null;
+
+  const folder = anim
+    ? back ? "gen5ani-back" : "gen5ani"
+    : back ? "gen5-back" : "gen5";
+  const ext = anim ? "gif" : "png";
+  const file = shiny ? `${id}-shiny` : id;
+
+  return `/sprite/${folder}/${file}.${ext}`;
+}
+
 // Turns one parsed battle-log line into a human readable string, or null
 // if it should be skipped entirely (chat/join/leave/timer noise etc).
-export function formatBattleLine(type, parts) {
+// `mySide` ("p1"/"p2"/null) controls "Your" vs "Opponent's" wording.
+export function formatBattleLine(type, parts, mySide = null) {
+  const mine = (side) =>
+    mySide ? side.startsWith(mySide) : side.startsWith("p1");
+
   switch (type) {
     case "raw":
       return parts[0];
+
     case "player":
-      return null;
     case "teamsize":
-      return null;
     case "gametype":
-      return null;
     case "gen":
-      return null;
-    case "tier":
-      return `Format: ${parts[0]}`;
     case "rule":
-      return null;
     case "clearpoke":
-      return null;
     case "poke":
-      return null;
-    case "teampreview":
-      return "Team preview.";
-    case "start":
-      return "Battle started!";
-    case "turn":
-      return `--- Turn ${parts[0]} ---`;
     case "upkeep":
     case "inactive":
     case "inactiveoff":
@@ -89,7 +142,21 @@ export function formatBattleLine(type, parts) {
     case "chat":
     case ":":
     case "c:":
+    case "-item":
+    case "html":
+    case "uhtml":
+    case "uhtmlchange":
       return null;
+
+    case "tier":
+      return `Format: ${parts[0]}`;
+    case "teampreview":
+      return "Team preview.";
+    case "start":
+      return "Battle started!";
+    case "turn":
+      return `--- Turn ${parts[0]} ---`;
+
     case "move": {
       const src = parseIdent(parts[0]);
       return `${src.name} used ${parts[1]}!`;
@@ -97,12 +164,12 @@ export function formatBattleLine(type, parts) {
     case "switch":
     case "drag": {
       const p = parseIdent(parts[0]);
-      const species = parts[1].split(",")[0];
-      return `${p.side.startsWith("p1") ? "Your" : "Opponent's"} ${species} (${p.name}) came in.`;
+      const species = String(parts[1] || "").split(",")[0];
+      return `${mine(p.side) ? "Your" : "Opponent's"} ${species} (${p.name}) came in.`;
     }
     case "faint": {
       const p = parseIdent(parts[0]);
-      return `${p.name} fainted!`;
+      return `${mine(p.side) ? "Your" : "Opponent's"} ${p.name} fainted!`;
     }
     case "-damage": {
       const p = parseIdent(parts[0]);
@@ -166,8 +233,6 @@ export function formatBattleLine(type, parts) {
       const p = parseIdent(parts[0]);
       return `${p.name}'s ability: ${parts[1]}`;
     }
-    case "-item":
-      return null;
     case "-enditem": {
       const p = parseIdent(parts[0]);
       return `${p.name} used its ${parts[1]}!`;
@@ -180,10 +245,7 @@ export function formatBattleLine(type, parts) {
       return `Error: ${parts[0]}`;
     case "message":
       return parts[0];
-    case "html":
-    case "uhtml":
-    case "uhtmlchange":
-      return null; // rendering arbitrary HTML is out of scope for a feature-phone log
+
     default:
       // Fallback so nothing silently disappears -- useful for debugging too.
       return parts.length ? `[${type}] ${parts.join(" ")}` : null;
