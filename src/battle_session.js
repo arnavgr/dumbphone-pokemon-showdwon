@@ -19,6 +19,36 @@ import {
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
 const ANIMATED_SPRITES = true;
 
+// ---------------------------------------------------------------------------
+// Global Data Caches: Persist across DO invocations in the V8 isolate.
+// We use Singleton Promises to prevent duplicate 2MB downloads on cold starts.
+// ---------------------------------------------------------------------------
+let pokedexCache = null;
+let pokedexPromise = null;
+async function getPokedex() {
+  if (pokedexCache) return pokedexCache;
+  if (!pokedexPromise) {
+    pokedexPromise = fetch("https://play.pokemonshowdown.com/data/pokedex.json")
+      .then(res => res.ok ? res.json() : {})
+      .then(data => { pokedexCache = data || {}; return pokedexCache; })
+      .catch(() => { pokedexCache = {}; return pokedexCache; });
+  }
+  return pokedexPromise;
+}
+
+let movesCache = null;
+let movesPromise = null;
+async function getMoves() {
+  if (movesCache) return movesCache;
+  if (!movesPromise) {
+    movesPromise = fetch("https://play.pokemonshowdown.com/data/moves.json")
+      .then(res => res.ok ? res.json() : {})
+      .then(data => { movesCache = data || {}; return movesCache; })
+      .catch(() => { movesCache = {}; return movesCache; });
+  }
+  return movesPromise;
+}
+
 const DEFAULT_STATE = {
   connected: false,
   username: null,
@@ -38,7 +68,7 @@ const DEFAULT_STATE = {
   team: "",
   notice: null,
   loginError: null,
-  upstreamCookie: null, // Used to preserve the Showdown session
+  upstreamCookie: null, 
 };
 
 export class BattleSession extends DurableObject {
@@ -97,10 +127,14 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  upsertActive(parts) {
+  async upsertActive(parts) {
     const p = parseIdent(parts[0] || "");
     const { species, shiny } = parseDetails(parts[1] || "");
     const condition = parts[2] || "";
+
+    const dex = await getPokedex();
+    const id = normalizeName(species);
+    const types = dex[id]?.types || [];
 
     this.state_.active[p.side] = {
       slot: p.side,
@@ -108,6 +142,7 @@ export class BattleSession extends DurableObject {
       species,
       condition,
       shiny,
+      types,
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
       spriteBack: spriteUrl(species, { shiny, back: true, anim: ANIMATED_SPRITES }),
     };
@@ -180,8 +215,18 @@ export class BattleSession extends DurableObject {
       return;
     }
 
+    if (!this.state_.upstreamCookie) {
+      try {
+        const infoRes = await fetch("https://sim3.psim.us/showdown/info");
+        const sc = infoRes.headers.get("Set-Cookie");
+        if (sc) {
+          const match = sc.match(/(sid=[^;]+)/);
+          if (match) this.state_.upstreamCookie = match[1];
+        }
+      } catch {}
+    }
+
     const headers = new Headers({ Upgrade: "websocket" });
-    
     if (this.state_.upstreamCookie) {
       headers.set("Cookie", this.state_.upstreamCookie);
     }
@@ -200,6 +245,10 @@ export class BattleSession extends DurableObject {
 
     ws.accept();
     
+    if (this.state_.roomId && !this.state_.ended) {
+      ws.send(`|/join ${this.state_.roomId}`);
+    }
+
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
       try {
@@ -322,6 +371,29 @@ export class BattleSession extends DurableObject {
           ).slice(0, 2);
           if (side === "p1" || side === "p2") this.state_.mySide = side;
 
+          const dex = await getPokedex();
+          const movesData = await getMoves();
+
+          // Append type data to swappable Pokémon array
+          if (req.side && req.side.pokemon) {
+             for (const p of req.side.pokemon) {
+                const species = String(p.details || "").split(",")[0].trim();
+                const id = normalizeName(species);
+                if (dex[id] && dex[id].types) p.types = dex[id].types;
+             }
+          }
+          // Append type data to active move choices array
+          if (req.active) {
+             for (const active of req.active) {
+                if (active.moves) {
+                   for (const m of active.moves) {
+                      const mId = normalizeName(m.move);
+                      if (movesData[mId] && movesData[mId].type) m.type = movesData[mId].type;
+                   }
+                }
+             }
+          }
+
           this.state_.request = req;
         } catch { }
         break;
@@ -336,7 +408,7 @@ export class BattleSession extends DurableObject {
 
       case "switch":
       case "drag": {
-        if (roomId === this.state_.roomId) this.upsertActive(parts);
+        if (roomId === this.state_.roomId) await this.upsertActive(parts);
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }

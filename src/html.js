@@ -1,3 +1,5 @@
+import { spriteUrl } from "./protocol.js";
+
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
 function esc(s) {
@@ -93,8 +95,10 @@ function renderActive(state, which) {
         info.nickname && info.nickname !== info.species
           ? ` <small>(${esc(info.nickname)})</small>`
           : "";
+      
+      const types = info.types && info.types.length ? ` <small>[${esc(info.types.join("/"))}]</small>` : "";
 
-      return `<div class="mon">${img}<div>${esc(label)}${nick}</div>${hpBar(info.condition)}</div>`;
+      return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}</div>`;
     })
     .join("");
 }
@@ -233,7 +237,18 @@ export function renderBattle(state) {
       body += `<h2>Choose lead</h2>`;
       (req.side?.pokemon || []).forEach((p, i) => {
         const species = (p.details || "").split(",")[0];
-        body += `<a href="/lead?i=${i + 1}">${i + 1}. ${esc(species)} (${esc(p.condition || "")})</a>`;
+        const typesText = p.types ? esc(p.types.join("/")) : "";
+        const imgUrl = spriteUrl(species, { anim: false });
+
+        body += `<a href="/lead?i=${i + 1}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
+          <table border="0" cellpadding="0" cellspacing="0"><tr>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle" style="padding-left:4px;">
+              <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
+              <small>${typesText}</small>
+            </td>
+          </tr></table>
+        </a>`;
       });
       body += `<a href="/lead?i=1">Auto lead first</a>`;
     } else if (req.forceSwitch) {
@@ -242,7 +257,18 @@ export function renderBattle(state) {
         if (p.active || p.condition === "0 fnt") return;
         const species = (p.details || "").split(",")[0];
         const href = `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`;
-        body += `<a href="${esc(href)}">${i + 1}. ${esc(species)} (${esc(p.condition || "")})</a>`;
+        const typesText = p.types ? esc(p.types.join("/")) : "";
+        const imgUrl = spriteUrl(species, { anim: false });
+
+        body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
+          <table border="0" cellpadding="0" cellspacing="0"><tr>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle" style="padding-left:4px;">
+              <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
+              <small>${typesText}</small>
+            </td>
+          </tr></table>
+        </a>`;
       });
     } else if (req.active) {
       if (req.active.length > 1) {
@@ -252,11 +278,12 @@ export function renderBattle(state) {
       const moves = req.active[0]?.moves || [];
       body += `<h2>Choose a move</h2>`;
       moves.forEach((m, i) => {
+        const typeStr = m.type ? ` [${esc(m.type)}]` : "";
         if (m.disabled) {
-          body += `<p>${i + 1}. ${esc(m.move)} (disabled)</p>`;
+          body += `<p>${i + 1}. ${esc(m.move)}${typeStr} (disabled)</p>`;
         } else {
           const href = `/choose?value=${encodeURIComponent(`move ${i + 1}`)}`;
-          body += `<a href="${esc(href)}">${i + 1}. ${esc(m.move)} (${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</a>`;
+          body += `<a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr} (${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</a>`;
         }
       });
       body += `<a href="/choose?value=${encodeURIComponent("default")}">Use default move</a>`;
@@ -266,7 +293,18 @@ export function renderBattle(state) {
         if (p.active || p.condition === "0 fnt") return;
         const species = (p.details || "").split(",")[0];
         const href = `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`;
-        body += `<a href="${esc(href)}">${esc(species)} (${esc(p.condition || "")})</a>`;
+        const typesText = p.types ? esc(p.types.join("/")) : "";
+        const imgUrl = spriteUrl(species, { anim: false });
+
+        body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
+          <table border="0" cellpadding="0" cellspacing="0"><tr>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle" style="padding-left:4px;">
+              <strong>${esc(species)}</strong> (${esc(p.condition || "")})<br>
+              <small>${typesText}</small>
+            </td>
+          </tr></table>
+        </a>`;
       });
     } else {
       body += `<p>Waiting on the other player...</p>`;
