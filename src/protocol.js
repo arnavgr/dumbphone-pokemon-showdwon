@@ -119,6 +119,8 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "customgroups":
     case "updateuser":
     case "challstr":
+    case "init":
+    case "users":
       return null;
 
     case "tier":

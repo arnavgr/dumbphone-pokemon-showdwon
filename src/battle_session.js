@@ -13,7 +13,6 @@ import {
   renderBattle,
   renderError,
   renderLogin,
-  renderTeam,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
@@ -53,9 +52,9 @@ const DEFAULT_STATE = {
   connected: false,
   username: null,
   loggedIn: false,
-  mySide: null, 
-  players: {},  
-  active: {},   
+  mySide: null,
+  players: {},
+  active: {},
   roomId: null,
   roomTitle: null,
   log: [],
@@ -65,10 +64,13 @@ const DEFAULT_STATE = {
   ended: false,
   resultMsg: null,
   challstr: null,
-  team: "",
   notice: null,
   loginError: null,
-  upstreamCookie: null, 
+  upstreamCookie: null,
+  // {userid: format} of challenges other people have sent you
+  challengesFrom: {},
+  // {to, format} if you're currently challenging someone, else null
+  challengeTo: null,
 };
 
 export class BattleSession extends DurableObject {
@@ -85,6 +87,7 @@ export class BattleSession extends DurableObject {
       this.state_ = { ...DEFAULT_STATE, ...(saved || {}) };
       if (!this.state_.players) this.state_.players = {};
       if (!this.state_.active) this.state_.active = {};
+      if (!this.state_.challengesFrom) this.state_.challengesFrom = {};
     });
   }
 
@@ -244,7 +247,7 @@ export class BattleSession extends DurableObject {
     }
 
     ws.accept();
-    
+
     if (this.state_.roomId && !this.state_.ended) {
       ws.send(`|/join ${this.state_.roomId}`);
     }
@@ -252,9 +255,9 @@ export class BattleSession extends DurableObject {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
       try {
-        if (this.ws && this.ws.readyState === 1) this.ws.send(""); 
+        if (this.ws && this.ws.readyState === 1) this.ws.send("");
       } catch {}
-    }, 45000); 
+    }, 45000);
 
     ws.addEventListener("message", (event) => {
       this.ctx.waitUntil(this.onSocketMessage(event.data));
@@ -340,6 +343,8 @@ export class BattleSession extends DurableObject {
       }
 
       case "updatesearch": {
+        // Fired for ALL games the user is in - both matchmaking AND
+        // accepted friend challenges - so this one handler covers both.
         try {
           const json = JSON.parse(parts[0]);
           this.state_.searching = json.searching || [];
@@ -352,6 +357,16 @@ export class BattleSession extends DurableObject {
               this.sendToRoom(ids[0], "/join " + ids[0]);
             }
           }
+        } catch { }
+        break;
+      }
+
+      case "updatechallenges": {
+        // {challengesFrom: {userid: format}, challengeTo: {to, format} | null}
+        try {
+          const json = JSON.parse(parts[0]);
+          this.state_.challengesFrom = json.challengesFrom || {};
+          this.state_.challengeTo = json.challengeTo || null;
         } catch { }
         break;
       }
@@ -466,7 +481,7 @@ export class BattleSession extends DurableObject {
     return new Response(body, {
       headers: {
         "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store", 
+        "cache-control": "no-store",
       },
     });
   }
@@ -478,13 +493,9 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/search") {
         const format = url.searchParams.get("format") || "gen9randombattle";
-        const useTeam = url.searchParams.get("team") === "1";
-        const team =
-          useTeam && this.state_.team && this.state_.team.trim()
-            ? this.state_.team.trim().replace(/\r?\n/g, "")
-            : null;
-
-        this.send(`|/utm ${team || "null"}`);
+        // Only random formats are offered, and those never need a
+        // user-built team, so we always search with a null team.
+        this.send(`|/utm null`);
         this.send(`|/search ${format}`);
         this.state_.notice = `Searching for ${format}...`;
         await this.save();
@@ -495,6 +506,46 @@ export class BattleSession extends DurableObject {
         this.send(`|/cancelsearch`);
         this.state_.searching = [];
         await this.save();
+        return Response.redirect(new URL("/", url), 302);
+      }
+
+      if (url.pathname === "/challenge") {
+        if (request.method === "POST") {
+          const params = await this.readForm(request);
+          const target = (params.get("username") || "").trim();
+          const format = params.get("format") || "gen9randombattle";
+          if (target) {
+            this.send(`|/utm null`);
+            this.send(`|/challenge ${target}, ${format}`);
+            this.state_.notice = `Challenge sent to ${target}.`;
+            await this.save();
+          }
+        }
+        return Response.redirect(new URL("/", url), 302);
+      }
+
+      if (url.pathname === "/cancelchallenge") {
+        const to = this.state_.challengeTo && this.state_.challengeTo.to;
+        if (to) {
+          try { this.send(`|/cancelchallenge ${to}`); } catch {}
+        }
+        return Response.redirect(new URL("/", url), 302);
+      }
+
+      if (url.pathname === "/accept") {
+        const user = url.searchParams.get("user");
+        if (user) {
+          this.send(`|/utm null`);
+          this.send(`|/accept ${user}`);
+        }
+        return Response.redirect(new URL("/", url), 302);
+      }
+
+      if (url.pathname === "/reject") {
+        const user = url.searchParams.get("user");
+        if (user) {
+          try { this.send(`|/reject ${user}`); } catch {}
+        }
         return Response.redirect(new URL("/", url), 302);
       }
 
@@ -512,7 +563,7 @@ export class BattleSession extends DurableObject {
             this.state_.roomId,
             `/choose ${value}${rqid !== undefined ? "|" + rqid : ""}`
           );
-          this.state_.request = null; 
+          this.state_.request = null;
           await this.save();
         }
         return Response.redirect(new URL("/battle", url), 302);
@@ -586,18 +637,6 @@ export class BattleSession extends DurableObject {
         this.state_.mySide = null;
         await this.save();
         return Response.redirect(new URL("/", url), 302);
-      }
-
-      if (url.pathname === "/team") {
-        if (request.method === "POST") {
-          const params = await this.readForm(request);
-          const team = params.get("team") || "";
-          this.state_.team = team.replace(/\r?\n/g, "").trim();
-          this.state_.notice = "Team saved.";
-          await this.save();
-          return Response.redirect(new URL("/", url), 302);
-        }
-        return this.htmlResponse(renderTeam(this.state_));
       }
 
       if (url.pathname === "/battle") {

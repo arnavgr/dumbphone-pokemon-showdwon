@@ -2,6 +2,17 @@ import { spriteUrl } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
+// Only the random formats worth surfacing on a keypad-only phone: no
+// teambuilder, so only formats that hand you a randomized team belong here.
+// gen9randombattle is by far Showdown's biggest ladder; gen9hackmonscup and
+// gen8randombattle are the next most-played random formats that stay
+// singles-only (so the existing move/switch UI below handles them fine).
+const RANDOM_FORMATS = [
+  ["gen9randombattle", "Gen 9 Random Battle"],
+  ["gen9hackmonscup", "Gen 9 Hackmons Cup"],
+  ["gen8randombattle", "Gen 8 Random Battle"],
+];
+
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => {
     return {
@@ -37,7 +48,7 @@ img { image-rendering: pixelated; vertical-align: middle; }
 .log { border-top: 1px solid #aaa; margin-top: 8px; padding-top: 5px; }
 .log div { margin: 2px 0; }
 .small { font-size: 11px; color: #444; }
-input, textarea { max-width: 220px; }
+input, textarea, select { max-width: 220px; }
 </style>
 </head>
 <body>
@@ -95,7 +106,7 @@ function renderActive(state, which) {
         info.nickname && info.nickname !== info.species
           ? ` <small>(${esc(info.nickname)})</small>`
           : "";
-      
+
       const types = info.types && info.types.length ? ` <small>[${esc(info.types.join("/"))}]</small>` : "";
 
       return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}</div>`;
@@ -108,22 +119,42 @@ function renderLog(log) {
   return `${recent.map((l) => `<div>${esc(l)}</div>`).join("") || "<div>(no messages yet)</div>"}`;
 }
 
+function renderChallenges(state) {
+  let body = `<h2>Battle a friend</h2>`;
+
+  const incoming = Object.entries(state.challengesFrom || {});
+  if (incoming.length) {
+    for (const [userid, format] of incoming) {
+      body += `<p><strong>${esc(userid)}</strong> challenged you to ${esc(format)}</p>`;
+      body += `<a href="/accept?user=${encodeURIComponent(userid)}">Accept</a>`;
+      body += `<a href="/reject?user=${encodeURIComponent(userid)}">Reject</a>`;
+    }
+  }
+
+  if (state.challengeTo && state.challengeTo.to) {
+    body += `<p>Challenging <strong>${esc(state.challengeTo.to)}</strong> to ${esc(
+      state.challengeTo.format || ""
+    )}...</p>`;
+    body += `<a href="/cancelchallenge">Cancel challenge</a>`;
+  } else {
+    body += `
+<form method="post" action="/challenge">
+<label>Friend's username<br><input name="username" maxlength="50"></label>
+<br><br>
+<label>Format<br>
+<select name="format">
+${RANDOM_FORMATS.map(([id, label]) => `<option value="${esc(id)}">${esc(label)}</option>`).join("")}
+</select>
+</label>
+<br><br>
+<input type="submit" value="Send challenge">
+</form>`;
+  }
+
+  return body;
+}
+
 export function renderHome(state) {
-  const randomFormats = [
-    ["gen9randombattle", "Gen 9 Random Battle"],
-    ["gen9randomdoublesbattle", "Gen 9 Random Doubles"],
-    ["gen8randombattle", "Gen 8 Random Battle"],
-    ["gen1randombattle", "Gen 1 Random Battle"],
-  ];
-
-  const teamFormats = [
-    ["gen9ou", "Gen 9 OU"],
-    ["gen9uu", "Gen 9 UU"],
-    ["gen9nu", "Gen 9 NU"],
-    ["gen9pu", "Gen 9 PU"],
-    ["gen9lc", "Gen 9 LC"],
-  ];
-
   let body = `<h1>PS CloudPhone</h1>`;
 
   body += `<p>${
@@ -134,15 +165,17 @@ export function renderHome(state) {
   if (state.loginError) body += `<p style="color:#b00">Login error: ${esc(state.loginError)}</p>`;
 
   body += `<p>
+<a href="/">Refresh</a>
 <a href="/login">Login</a>
 <a href="/logout">Logout</a>
-<a href="/team">Team importer</a>
 <a href="/reconnect">Reconnect</a>
 </p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><a href="/battle"><strong>&gt; Resume battle in progress</strong></a></p>`;
   }
+
+  body += renderChallenges(state);
 
   if (state.searching && state.searching.length) {
     body += `<h2>Searching</h2>`;
@@ -151,20 +184,11 @@ export function renderHome(state) {
     body += `<a href="/cancelsearch">Cancel search</a>`;
   } else {
     body += `<h2>Random battles</h2>`;
-    for (const [id, label] of randomFormats) {
+    for (const [id, label] of RANDOM_FORMATS) {
       const href = `/search?format=${encodeURIComponent(id)}`;
       body += `<a href="${esc(href)}">${esc(label)}</a>`;
     }
-    body += `<p class="small">Random formats pick sets for you - no team needed.</p>`;
-
-    body += `<h2>Constructed formats</h2>`;
-    if (!state.team) {
-      body += `<p class="small">No saved team yet. These need a packed team first.</p>`;
-    }
-    for (const [id, label] of teamFormats) {
-      const href = `/search?format=${encodeURIComponent(id)}&team=1`;
-      body += `<a href="${esc(href)}">${esc(label)} (use saved team)</a>`;
-    }
+    body += `<p class="small">Random formats pick a team for you - no team builder needed.</p>`;
   }
 
   if (state.ended && state.resultMsg) {
@@ -173,7 +197,11 @@ export function renderHome(state) {
     body += `<a href="/newgame">Start another battle</a>`;
   }
 
-  return page("PS CloudPhone", body, state.searching && state.searching.length ? 8 : 0);
+  const shouldAutoRefresh =
+    (state.searching && state.searching.length > 0) ||
+    Boolean(state.challengeTo && state.challengeTo.to);
+
+  return page("PS CloudPhone", body, shouldAutoRefresh ? 8 : 0);
 }
 
 export function renderLogin(state) {
@@ -193,20 +221,6 @@ export function renderLogin(state) {
 <p><a href="/">Back</a></p>`;
 
   return page("Login", body, 0);
-}
-
-export function renderTeam(state) {
-  const body = `
-<h1>Team importer</h1>
-<p class="small">Paste a <strong>packed</strong> Showdown team. Random battles ignore teams; constructed formats use the saved team.</p>
-<form method="post" action="/team">
-<textarea name="team" rows="10" cols="28">${esc(state.team || "")}</textarea>
-<br><br>
-<input type="submit" value="Save team">
-</form>
-<p><a href="/">Back</a></p>`;
-
-  return page("Team", body, 0);
 }
 
 export function renderBattle(state) {
