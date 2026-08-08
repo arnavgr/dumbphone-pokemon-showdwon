@@ -674,7 +674,18 @@ export class BattleSession extends DurableObject {
         return this.htmlResponse(renderBattle(this.state_));
       }
 
-      return this.htmlResponse(renderHome(this.state_));
+      // Both `notice` and `loginError` are one-shot flash messages (e.g.
+      // "Searching for gen9randombattle...", "Login error: ..."). Render
+      // them once, then clear + persist so they don't linger on every
+      // future page load/refresh - that stale-message bug was the whole
+      // reason "Searching for..." used to stick around forever.
+      const homeHtml = renderHome(this.state_);
+      if (this.state_.notice || this.state_.loginError) {
+        this.state_.notice = null;
+        this.state_.loginError = null;
+        await this.save();
+      }
+      return this.htmlResponse(homeHtml);
     } catch (err) {
       return new Response(renderError(err.message || String(err)), {
         status: 500,
