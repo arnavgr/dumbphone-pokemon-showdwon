@@ -13,6 +13,7 @@ import {
   renderBattle,
   renderError,
   renderLogin,
+  renderMoveInfo,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
@@ -138,6 +139,11 @@ export class BattleSession extends DurableObject {
     const dex = await getPokedex();
     const id = normalizeName(species);
     const types = dex[id]?.types || [];
+    // Showdown never sends us the opponent's actual computed stats (only
+    // our own team gets that in |request|), so base stats are the best
+    // approximation we can show for them - always labeled as "base stats"
+    // in the UI, never presented as the real thing.
+    const baseStats = dex[id]?.baseStats || null;
 
     this.state_.active[p.side] = {
       slot: p.side,
@@ -146,6 +152,7 @@ export class BattleSession extends DurableObject {
       condition,
       shiny,
       types,
+      baseStats,
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
       spriteBack: spriteUrl(species, { shiny, back: true, anim: ANIMATED_SPRITES }),
     };
@@ -389,21 +396,36 @@ export class BattleSession extends DurableObject {
           const dex = await getPokedex();
           const movesData = await getMoves();
 
-          // Append type data to swappable Pokémon array
+          // Append type data to swappable Pokémon array, plus the set of
+          // types their known moves cover (side.pokemon[].moves is a list
+          // of move IDs for ALL your team, not just the active one) - this
+          // is what powers the "type matchup" ranking on the battle page.
           if (req.side && req.side.pokemon) {
              for (const p of req.side.pokemon) {
                 const species = String(p.details || "").split(",")[0].trim();
                 const id = normalizeName(species);
                 if (dex[id] && dex[id].types) p.types = dex[id].types;
+                if (Array.isArray(p.moves)) {
+                  p.moveTypes = [...new Set(
+                    p.moves.map((mId) => movesData[mId]?.type).filter(Boolean)
+                  )];
+                }
              }
           }
-          // Append type data to active move choices array
+          // Append type data and a short effect description to active move
+          // choices array, so the battle page can explain what each move
+          // does without needing a separate data fetch per move.
           if (req.active) {
              for (const active of req.active) {
                 if (active.moves) {
                    for (const m of active.moves) {
-                      const mId = normalizeName(m.move);
-                      if (movesData[mId] && movesData[mId].type) m.type = movesData[mId].type;
+                      const mId = m.id || normalizeName(m.move);
+                      m.id = mId;
+                      const data = movesData[mId];
+                      if (data) {
+                        if (data.type) m.type = data.type;
+                        if (data.shortDesc || data.desc) m.shortDesc = data.shortDesc || data.desc;
+                      }
                    }
                 }
              }
@@ -589,6 +611,12 @@ export class BattleSession extends DurableObject {
           }
         }
         return Response.redirect(new URL("/battle", url), 302);
+      }
+
+      if (url.pathname === "/moveinfo") {
+        const moveId = url.searchParams.get("move") || "";
+        const movesData = await getMoves();
+        return this.htmlResponse(renderMoveInfo(movesData[moveId] || null, moveId));
       }
 
       if (url.pathname === "/timer") {

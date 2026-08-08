@@ -1,4 +1,4 @@
-import { spriteUrl } from "./protocol.js";
+import { spriteUrl, typeEffectiveness } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
@@ -48,6 +48,8 @@ img { image-rendering: pixelated; vertical-align: middle; }
 .log { border-top: 1px solid #aaa; margin-top: 8px; padding-top: 5px; }
 .log div { margin: 2px 0; }
 .small { font-size: 11px; color: #444; }
+.movedesc { margin: -3px 0 8px 2px; color: #333; }
+.statline { color: #555; }
 input, textarea, select { max-width: 220px; }
 </style>
 </head>
@@ -86,9 +88,33 @@ function activeForSide(state, which) {
     .map(([, info]) => info);
 }
 
+// Compact "atk/def/spa/spd/spe" string. A legend is printed once near the
+// top of each stats-bearing section instead of repeating labels per mon.
+function statsLine(stats) {
+  if (!stats) return null;
+  return `${stats.atk}/${stats.def}/${stats.spa}/${stats.spd}/${stats.spe}`;
+}
+
+function describeMultiplier(mult) {
+  if (mult === 0) return "no effect";
+  if (mult >= 4) return `${mult}x - devastating`;
+  if (mult === 2) return "2x - super effective";
+  if (mult === 1) return "1x - neutral";
+  if (mult === 0.5) return "0.5x - resisted";
+  return `${mult}x - barely scratches`;
+}
+
 function renderActive(state, which) {
   const mons = activeForSide(state, which);
   if (!mons.length) return `<div class="mon">?</div>`;
+
+  // Your own active mon's exact stats come from the request; the opponent's
+  // are never sent to you, so we fall back to Pokedex base stats for them
+  // (labeled as such below, since they aren't the real in-battle numbers).
+  const myActiveStats =
+    which === "my"
+      ? (state.request?.side?.pokemon || []).find((p) => p.active)?.stats
+      : null;
 
   return mons
     .map((info) => {
@@ -109,9 +135,67 @@ function renderActive(state, which) {
 
       const types = info.types && info.types.length ? ` <small>[${esc(info.types.join("/"))}]</small>` : "";
 
-      return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}</div>`;
+      let statsHtml = "";
+      if (which === "my" && myActiveStats) {
+        statsHtml = `<div class="small statline">Atk/Def/SpA/SpD/Spe: ${esc(statsLine(myActiveStats))}</div>`;
+      } else if (which === "opp" && info.baseStats) {
+        statsHtml = `<div class="small statline">Base stats: ${esc(statsLine(info.baseStats))}</div>`;
+      }
+
+      return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}${statsHtml}</div>`;
     })
     .join("");
+}
+
+// "Which of my Pokemon hits this thing hardest" - ranks every non-fainted
+// team member by the best effectiveness multiplier among their known move
+// types against the opponent's active type(s).
+function renderTypeMatchup(state) {
+  const req = state.request;
+  const teamPokemon = req?.side?.pokemon;
+  if (!teamPokemon || !teamPokemon.length) return "";
+
+  // state.active is keyed by full slot ("p1a", "p2a", ...), not bare
+  // "p1"/"p2", so reuse the same side-prefix lookup renderActive() uses
+  // rather than indexing directly.
+  const oppInfo = activeForSide(state, "opp")[0];
+  const oppTypes = oppInfo?.types;
+  if (!oppTypes || !oppTypes.length) return "";
+
+  const rows = teamPokemon
+    .filter((p) => p.condition !== "0 fnt")
+    .map((p) => {
+      const species = (p.details || "").split(",")[0];
+      const moveTypes = p.moveTypes || [];
+      const best = moveTypes.length
+        ? Math.max(...moveTypes.map((t) => typeEffectiveness(t, oppTypes)))
+        : null;
+      return { species, active: !!p.active, best };
+    })
+    .sort((a, b) => (b.best ?? -1) - (a.best ?? -1));
+
+  if (!rows.length) return "";
+
+  const oppLabel = oppInfo.species || oppInfo.nickname || "the opponent";
+
+  let body = `<h2>Type matchup vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]</h2>`;
+  for (const r of rows) {
+    const label = r.best === null ? "moves unknown" : describeMultiplier(r.best);
+    body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: <small>${esc(label)}</small></div>`;
+  }
+  return body;
+}
+
+// A move's shortDesc under its link, truncated defensively (most are well
+// under this already) with a "More" link to the full /moveinfo page for
+// anything that doesn't fit in one line on a keypad-phone screen.
+function renderMoveDesc(m) {
+  if (!m.shortDesc) return "";
+  const text = m.shortDesc.length > 90 ? `${m.shortDesc.slice(0, 87)}...` : m.shortDesc;
+  const moreLink = m.id
+    ? ` <a href="/moveinfo?move=${encodeURIComponent(m.id)}" style="display:inline">More</a>`
+    : "";
+  return `<div class="movedesc small">${esc(text)}${moreLink}</div>`;
 }
 
 function renderLog(log) {
@@ -234,6 +318,8 @@ export function renderBattle(state) {
   body += `<h2>Opponent</h2>`;
   body += renderActive(state, "opp");
 
+  body += renderTypeMatchup(state);
+
   body += `<div class="log">${renderLog(state.log)}</div>`;
 
   if (state.ended) {
@@ -249,17 +335,19 @@ export function renderBattle(state) {
   if (req) {
     if (req.teamPreview) {
       body += `<h2>Choose lead</h2>`;
+      body += `<p class="small">Stats shown as Atk/Def/SpA/SpD/Spe.</p>`;
       (req.side?.pokemon || []).forEach((p, i) => {
         const species = (p.details || "").split(",")[0];
         const typesText = p.types ? esc(p.types.join("/")) : "";
         const imgUrl = spriteUrl(species, { anim: false });
+        const stats = statsLine(p.stats);
 
         body += `<a href="/lead?i=${i + 1}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
             <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
-              <small>${typesText}</small>
+              <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
             </td>
           </tr></table>
         </a>`;
@@ -267,19 +355,21 @@ export function renderBattle(state) {
       body += `<a href="/lead?i=1">Auto lead first</a>`;
     } else if (req.forceSwitch) {
       body += `<h2>Choose a Pokemon to send out</h2>`;
+      body += `<p class="small">Stats shown as Atk/Def/SpA/SpD/Spe.</p>`;
       (req.side?.pokemon || []).forEach((p, i) => {
         if (p.active || p.condition === "0 fnt") return;
         const species = (p.details || "").split(",")[0];
         const href = `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`;
         const typesText = p.types ? esc(p.types.join("/")) : "";
         const imgUrl = spriteUrl(species, { anim: false });
+        const stats = statsLine(p.stats);
 
         body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
             <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
-              <small>${typesText}</small>
+              <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
             </td>
           </tr></table>
         </a>`;
@@ -299,23 +389,26 @@ export function renderBattle(state) {
           const href = `/choose?value=${encodeURIComponent(`move ${i + 1}`)}`;
           body += `<a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr} (${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</a>`;
         }
+        body += renderMoveDesc(m);
       });
       body += `<a href="/choose?value=${encodeURIComponent("default")}">Use default move</a>`;
 
       body += `<h2>Switch out</h2>`;
+      body += `<p class="small">Stats shown as Atk/Def/SpA/SpD/Spe.</p>`;
       (req.side?.pokemon || []).forEach((p, i) => {
         if (p.active || p.condition === "0 fnt") return;
         const species = (p.details || "").split(",")[0];
         const href = `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`;
         const typesText = p.types ? esc(p.types.join("/")) : "";
         const imgUrl = spriteUrl(species, { anim: false });
+        const stats = statsLine(p.stats);
 
         body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
             <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${esc(species)}</strong> (${esc(p.condition || "")})<br>
-              <small>${typesText}</small>
+              <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
             </td>
           </tr></table>
         </a>`;
@@ -337,6 +430,29 @@ export function renderBattle(state) {
   const refresh = state.request ? 0 : 7;
 
   return page(state.roomTitle || "Battle", body, refresh);
+}
+
+export function renderMoveInfo(move, moveId) {
+  if (!move) {
+    return page(
+      "Move info",
+      `<h1>Move info</h1><p>Unknown move (${esc(moveId || "")}).</p><p><a href="/battle">Back to battle</a></p>`,
+      0
+    );
+  }
+
+  const accuracy = move.accuracy === true ? "always hits" : `${move.accuracy}%`;
+  const power = move.basePower ? move.basePower : "-";
+
+  let body = `<h1>${esc(move.name || moveId)}</h1>`;
+  body += `<p><small>${esc(move.type || "")}${move.category ? ` / ${esc(move.category)}` : ""}</small></p>`;
+  body += `<p>Power: ${esc(String(power))}<br>Accuracy: ${esc(String(accuracy))}<br>PP: ${esc(
+    String(move.pp ?? "?")
+  )}</p>`;
+  body += `<p>${esc(move.desc || move.shortDesc || "No description available.")}</p>`;
+  body += `<p><a href="/battle">Back to battle</a></p>`;
+
+  return page(move.name || "Move info", body, 0);
 }
 
 export function renderError(message) {

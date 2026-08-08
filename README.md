@@ -79,6 +79,29 @@ Durable Objects with SQLite storage (what this uses) are available on
 Cloudflare's **free** Workers plan, so this should cost nothing at your
 scale.
 
+## Battle-page intel
+
+The battle page (`/battle`) now shows more than just HP bars:
+
+- **Stats.** Your active Pokemon and every non-fainted teammate you can
+  switch to show their exact `Atk/Def/SpA/SpD/Spe` (Showdown sends these to
+  you directly in `|request|` for your own team). The opponent's active
+  Pokemon shows its **Pokedex base stats** instead, labeled as such -
+  Showdown never sends you the opponent's real computed stats, so this is
+  the closest approximation available, not the exact number.
+- **Type matchup.** A ranked list of your non-fainted team, sorted by the
+  best effectiveness multiplier among each one's *known* move types against
+  the opponent's current type(s) - e.g. "2x - super effective". This uses
+  the real movesets in `side.pokemon[].moves` (yes, Showdown sends you your
+  whole team's moves, not just your active Pokemon's) cross-referenced
+  against a hardcoded Gen 6+ type chart in `src/protocol.js`.
+- **Move descriptions.** Each selectable move shows its `shortDesc` inline.
+  If that's ever too long for a keypad screen, it's truncated with a "More"
+  link to a separate `/moveinfo?move=ID` page with the full description,
+  power, accuracy, and PP - kept as a distinct page (rather than an
+  expand/collapse widget) since there's no client-side JS available to
+  implement one.
+
 ## Battling a friend
 
 The home page has a "Battle a friend" section:
