@@ -7,6 +7,7 @@ import {
   normalizeName,
   parseDetails,
   spriteUrl,
+  typeEffectiveness,
 } from "./protocol.js";
 import {
   renderHome,
@@ -29,8 +30,8 @@ async function getPokedex() {
   if (pokedexCache) return pokedexCache;
   if (!pokedexPromise) {
     pokedexPromise = fetch("https://play.pokemonshowdown.com/data/pokedex.json")
-      .then(res => res.ok ? res.json() : {})
-      .then(data => { pokedexCache = data || {}; return pokedexCache; })
+      .then((res) => (res.ok ? res.json() : {}))
+      .then((data) => { pokedexCache = data || {}; return pokedexCache; })
       .catch(() => { pokedexCache = {}; return pokedexCache; });
   }
   return pokedexPromise;
@@ -42,11 +43,22 @@ async function getMoves() {
   if (movesCache) return movesCache;
   if (!movesPromise) {
     movesPromise = fetch("https://play.pokemonshowdown.com/data/moves.json")
-      .then(res => res.ok ? res.json() : {})
-      .then(data => { movesCache = data || {}; return movesCache; })
+      .then((res) => (res.ok ? res.json() : {}))
+      .then((data) => { movesCache = data || {}; return movesCache; })
       .catch(() => { movesCache = {}; return movesCache; });
   }
   return movesPromise;
+}
+
+// "|-sidestart|p1: Foo|move: Stealth Rock" -> "Stealth Rock"
+function cleanSideCond(s) {
+  return String(s || "").replace(/^move:\s*/i, "").trim();
+}
+
+// Idents come in as full slots ("p2a: X"); revealed/field maps are keyed by
+// the bare side ("p2") so lookups work no matter which slot is active.
+function sideKey(side) {
+  return String(side || "").slice(0, 2);
 }
 
 const DEFAULT_STATE = {
@@ -72,6 +84,11 @@ const DEFAULT_STATE = {
   challengesFrom: {},
   // {to, format} if you're currently challenging someone, else null
   challengeTo: null,
+  // Persistent "opponent has shown" tracker:
+  // side ("p1"/"p2") -> normalized species -> revealed info
+  revealed: {},
+  // Persistent field state (weather / terrains / per-side conditions)
+  field: { weather: null, fields: [], sides: {} },
 };
 
 export class BattleSession extends DurableObject {
@@ -89,6 +106,10 @@ export class BattleSession extends DurableObject {
       if (!this.state_.players) this.state_.players = {};
       if (!this.state_.active) this.state_.active = {};
       if (!this.state_.challengesFrom) this.state_.challengesFrom = {};
+      if (!this.state_.revealed) this.state_.revealed = {};
+      if (!this.state_.field) this.state_.field = { weather: null, fields: [], sides: {} };
+      if (!this.state_.field.fields) this.state_.field.fields = [];
+      if (!this.state_.field.sides) this.state_.field.sides = {};
     });
   }
 
@@ -116,6 +137,8 @@ export class BattleSession extends DurableObject {
       mySide: null,
       players: {},
       active: {},
+      revealed: {},
+      field: { weather: null, fields: [], sides: {} },
     });
   }
 
@@ -131,19 +154,41 @@ export class BattleSession extends DurableObject {
     }
   }
 
+  oppSide() {
+    const mySide = this.state_.mySide || "p1";
+    return mySide === "p1" ? "p2" : "p1";
+  }
+
+  oppActiveInfo() {
+    const oppPrefix = this.oppSide();
+    for (const [slot, info] of Object.entries(this.state_.active || {})) {
+      if (slot.startsWith(oppPrefix)) return info;
+    }
+    return null;
+  }
+
   async upsertActive(parts) {
     const p = parseIdent(parts[0] || "");
-    const { species, shiny } = parseDetails(parts[1] || "");
+    const { species, shiny, level } = parseDetails(parts[1] || "");
     const condition = parts[2] || "";
-
     const dex = await getPokedex();
     const id = normalizeName(species);
-    const types = dex[id]?.types || [];
-    // Showdown never sends us the opponent's actual computed stats (only
-    // our own team gets that in |request|), so base stats are the best
-    // approximation we can show for them - always labeled as "base stats"
-    // in the UI, never presented as the real thing.
-    const baseStats = dex[id]?.baseStats || null;
+    const entry = dex[id] || {};
+    const types = entry.types || [];
+
+    // Showdown never sends the opponent's real computed stats (only your own
+    // team, via |request|), so for them we estimate Spe from the Pokedex
+    // using the standard random-battle spread: 85 IVs, 0 EVs, neutral nature,
+    // scaled by the level from the switch-in details line. Clearly labeled
+    // "predicted" in the UI, never presented as exact.
+    const baseStats = entry.baseStats || null;
+    let predictedSpeed = null;
+    if (baseStats && Number.isFinite(baseStats.spe) && level) {
+      predictedSpeed = Math.floor(((2 * baseStats.spe + 85) * level) / 100) + 5;
+    }
+    const possibleAbilities = entry.abilities
+      ? [...new Set(Object.values(entry.abilities))]
+      : [];
 
     this.state_.active[p.side] = {
       slot: p.side,
@@ -151,8 +196,13 @@ export class BattleSession extends DurableObject {
       species,
       condition,
       shiny,
+      level,
       types,
-      baseStats,
+      predictedSpeed,
+      possibleAbilities,
+      ability: null,
+      usedMoves: [],
+      boosts: {}, // fresh object = boosts naturally reset on switch-in
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
       spriteBack: spriteUrl(species, { shiny, back: true, anim: ANIMATED_SPRITES }),
     };
@@ -162,6 +212,53 @@ export class BattleSession extends DurableObject {
     const p = parseIdent(parts[0] || "");
     const mon = this.state_.active[p.side];
     if (mon) mon.condition = parts[1] || "";
+  }
+
+  // --- Opponent revealed-team tracker -------------------------------------
+
+  trackRevealed(parts) {
+    const p = parseIdent(parts[0] || "");
+    const { species, level } = parseDetails(parts[1] || "");
+    if (!p.side || !species) return;
+    const side = sideKey(p.side);
+    const sideMap = this.state_.revealed[side] || (this.state_.revealed[side] = {});
+    const key = normalizeName(species);
+    const existing = sideMap[key];
+    sideMap[key] = {
+      species,
+      nickname: p.name,
+      level,
+      condition: parts[2] || existing?.condition || "",
+      ability: existing?.ability || null,
+      usedMoves: existing?.usedMoves || [],
+      lastSeenTurn: this.state_.turn,
+    };
+  }
+
+  syncRevealedCondition(side) {
+    const mon = this.state_.active[side];
+    if (!mon || !mon.species) return;
+    const entry = this.state_.revealed[sideKey(side)]?.[normalizeName(mon.species)];
+    if (!entry) return;
+    entry.condition = mon.condition;
+    if (mon.ability) entry.ability = mon.ability;
+  }
+
+  // --- Boost helpers --------------------------------------------------------
+
+  adjustBoosts(parts, mode) {
+    const p = parseIdent(parts[0] || "");
+    const mon = this.state_.active[p.side];
+    if (!mon) return;
+    mon.boosts = mon.boosts || {};
+    const stat = parts[1];
+    const amt = Number(parts[2]) || 1;
+    if (mode === "set") {
+      mon.boosts[stat] = Math.max(-6, Math.min(6, amt));
+    } else {
+      const delta = mode === "down" ? -amt : amt;
+      mon.boosts[stat] = Math.max(-6, Math.min(6, (mon.boosts[stat] || 0) + delta));
+    }
   }
 
   async readForm(request) {
@@ -176,7 +273,6 @@ export class BattleSession extends DurableObject {
     if (!this.state_.challstr) {
       throw new Error("No challstr received yet. Refresh and try again.");
     }
-
     const body = new URLSearchParams();
     body.set("act", "login");
     body.set("name", username);
@@ -188,32 +284,25 @@ export class BattleSession extends DurableObject {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     });
-
     const text = await res.text();
     let jsonText = text.trim();
     if (jsonText.startsWith("]")) jsonText = jsonText.slice(1);
-
     let data;
     try {
       data = JSON.parse(jsonText);
     } catch {
       throw new Error(`Unexpected login response: ${text.slice(0, 120)}`);
     }
-
     const action = Array.isArray(data?.actions) ? data.actions[0] : data;
     const assertion =
       action?.assertion || data?.assertion || action?.data?.assertion || null;
-
     if (!assertion) {
       throw new Error(
         action?.actionerror || data?.actionerror || "Login failed."
       );
     }
-
     const finalName = action?.username || username;
-
     this.send(`|/trn ${finalName},0,${assertion}`);
-
     this.state_.username = finalName;
     this.state_.loggedIn = true;
     this.state_.loginError = null;
@@ -224,7 +313,6 @@ export class BattleSession extends DurableObject {
     if (this.ws && this.ws.readyState === 1 /* OPEN */) {
       return;
     }
-
     if (!this.state_.upstreamCookie) {
       try {
         const infoRes = await fetch("https://sim3.psim.us/showdown/info");
@@ -240,13 +328,11 @@ export class BattleSession extends DurableObject {
     if (this.state_.upstreamCookie) {
       headers.set("Cookie", this.state_.upstreamCookie);
     }
-
     const resp = await fetch(SHOWDOWN_WS_URL, { headers });
     const ws = resp.webSocket;
     if (!ws) {
       throw new Error("Showdown server did not accept the WebSocket upgrade");
     }
-
     const setCookie = resp.headers.get("Set-Cookie");
     if (setCookie) {
       const match = setCookie.match(/(sid=[^;]+)/);
@@ -254,7 +340,6 @@ export class BattleSession extends DurableObject {
     }
 
     ws.accept();
-
     if (this.state_.roomId && !this.state_.ended) {
       ws.send(`|/join ${this.state_.roomId}`);
     }
@@ -319,6 +404,7 @@ export class BattleSession extends DurableObject {
   async handleLine(roomId, rawLine) {
     const { type, parts } = parseLine(rawLine);
     const mySide = this.state_.mySide;
+    const inBattle = roomId === this.state_.roomId;
 
     switch (type) {
       case "challstr": {
@@ -327,7 +413,7 @@ export class BattleSession extends DurableObject {
         if (this.state_.roomId && !this.state_.ended) {
           try {
             this.sendToRoom(this.state_.roomId, `/join ${this.state_.roomId}`);
-          } catch { }
+          } catch {}
         }
         break;
       }
@@ -364,30 +450,30 @@ export class BattleSession extends DurableObject {
               this.sendToRoom(ids[0], "/join " + ids[0]);
             }
           }
-        } catch { }
+        } catch {}
         break;
       }
 
       case "updatechallenges": {
-        // {challengesFrom: {userid: format}, challengeTo: {to, format} | null}
         try {
           const json = JSON.parse(parts[0]);
           this.state_.challengesFrom = json.challengesFrom || {};
           this.state_.challengeTo = json.challengeTo || null;
-        } catch { }
+        } catch {}
         break;
       }
 
       case "title": {
-        if (roomId === this.state_.roomId) this.state_.roomTitle = parts[0];
+        if (inBattle) this.state_.roomTitle = parts[0];
         break;
       }
 
       case "request": {
-        if (roomId !== this.state_.roomId) break;
-        if (!parts[0]) { this.state_.request = null; break; }
+        if (!inBattle) break;
+        if (!parts[0] || parts[0] === "null") { this.state_.request = null; break; }
         try {
           const req = JSON.parse(parts[0]);
+          if (!req) { this.state_.request = null; break; }
           const side = String(
             req?.side?.id || req?.side?.pokemon?.[0]?.ident || ""
           ).slice(0, 2);
@@ -396,79 +482,312 @@ export class BattleSession extends DurableObject {
           const dex = await getPokedex();
           const movesData = await getMoves();
 
-          // Append type data to swappable Pokémon array, plus the set of
-          // types their known moves cover (side.pokemon[].moves is a list
-          // of move IDs for ALL your team, not just the active one) - this
-          // is what powers the "type matchup" ranking on the battle page.
+          // Append type data to swappable Pokemon array. moveTypes only
+          // includes DAMAGING moves (category !== Status, basePower > 0) -
+          // a Will-O-Wisp's Fire typing used to pollute the "who hits
+          // hardest" ranking, which makes no sense.
           if (req.side && req.side.pokemon) {
-             for (const p of req.side.pokemon) {
-                const species = String(p.details || "").split(",")[0].trim();
-                const id = normalizeName(species);
-                if (dex[id] && dex[id].types) p.types = dex[id].types;
-                if (Array.isArray(p.moves)) {
-                  p.moveTypes = [...new Set(
-                    p.moves.map((mId) => movesData[mId]?.type).filter(Boolean)
-                  )];
-                }
-             }
+            for (const p of req.side.pokemon) {
+              const species = String(p.details || "").split(",")[0].trim();
+              const id = normalizeName(species);
+              if (dex[id] && dex[id].types) p.types = dex[id].types;
+              if (Array.isArray(p.moves)) {
+                p.moveTypes = [...new Set(
+                  p.moves
+                    .map((mId) => {
+                      const d = movesData[mId];
+                      if (!d || d.category === "Status") return null;
+                      if (!(Number(d.basePower) > 0)) return null;
+                      return d.type || null;
+                    })
+                    .filter(Boolean)
+                )];
+              }
+            }
           }
-          // Append type data and a short effect description to active move
-          // choices array, so the battle page can explain what each move
-          // does without needing a separate data fetch per move.
+
+          // Enrich active move choices: type, shortDesc, and effectiveness
+          // vs the opponent's CURRENT types (tera-aware, since
+          // -terastallize rewrites active.types).
+          const oppTypes = this.oppActiveInfo()?.types || [];
           if (req.active) {
-             for (const active of req.active) {
-                if (active.moves) {
-                   for (const m of active.moves) {
-                      const mId = m.id || normalizeName(m.move);
-                      m.id = mId;
-                      const data = movesData[mId];
-                      if (data) {
-                        if (data.type) m.type = data.type;
-                        if (data.shortDesc || data.desc) m.shortDesc = data.shortDesc || data.desc;
-                      }
-                   }
+            for (const active of req.active) {
+              if (!active.moves) continue;
+              for (const m of active.moves) {
+                const mId = m.id || normalizeName(m.move);
+                m.id = mId;
+                const data = movesData[mId];
+                if (data) {
+                  if (data.type) m.type = data.type;
+                  if (data.category) m.category = data.category;
+                  if (data.shortDesc || data.desc) m.shortDesc = data.shortDesc || data.desc;
                 }
-             }
+                if (m.category !== "Status" && m.type && oppTypes.length) {
+                  m.oppMult = typeEffectiveness(m.type, oppTypes);
+                }
+              }
+            }
           }
 
           this.state_.request = req;
-        } catch { }
+        } catch {}
         break;
       }
 
       case "turn": {
-        if (roomId !== this.state_.roomId) break;
-        this.state_.turn = Number(parts[0]) || this.state_.turn;
+        if (inBattle) {
+          this.state_.turn = Number(parts[0]) || this.state_.turn;
+        }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "switch":
       case "drag": {
-        if (roomId === this.state_.roomId) await this.upsertActive(parts);
+        if (inBattle) {
+          await this.upsertActive(parts);
+          this.trackRevealed(parts); // accumulate opponent's (and our) shown mons
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "move": {
+        if (inBattle) {
+          // Track used moves so the UI can show "seen moves" per mon.
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          const mv = parts[1];
+          if (mon && mv) {
+            mon.usedMoves = mon.usedMoves || [];
+            if (!mon.usedMoves.includes(mv)) mon.usedMoves.push(mv);
+            const entry =
+              this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
+            if (entry) {
+              entry.usedMoves = entry.usedMoves || [];
+              if (!entry.usedMoves.includes(mv)) entry.usedMoves.push(mv);
+            }
+          }
+        }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "-damage":
       case "-heal": {
-        if (roomId === this.state_.roomId) this.updateActiveCondition(parts);
+        if (inBattle) {
+          this.updateActiveCondition(parts);
+          const p = parseIdent(parts[0] || "");
+          this.syncRevealedCondition(p.side);
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-status": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          if (mon && parts[1]) {
+            const hp = String(mon.condition || "100/100").split(" ")[0];
+            mon.condition = `${hp} ${parts[1]}`;
+            this.syncRevealedCondition(p.side);
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-curestatus": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          if (mon) {
+            mon.condition = String(mon.condition || "100/100").split(" ")[0];
+            this.syncRevealedCondition(p.side);
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-boost":
+      case "-unboost": {
+        if (inBattle) this.adjustBoosts(parts, type === "-unboost" ? "down" : "up");
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-setboost": {
+        if (inBattle) this.adjustBoosts(parts, "set");
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-clearboost": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          if (mon) mon.boosts = {};
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-clearallboost": {
+        if (inBattle) {
+          for (const mon of Object.values(this.state_.active)) mon.boosts = {};
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-ability": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          if (mon && parts[1]) {
+            mon.ability = parts[1];
+            const entry =
+              this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
+            if (entry) entry.ability = parts[1];
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-terastallize": {
+        if (inBattle) {
+          // Tera rewrites the mon's defensive typing - keep matchup math right.
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          const teraType = parts[1];
+          if (mon && teraType) {
+            mon.types = [teraType];
+            mon.teraType = teraType;
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-formechange": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          const newSpecies = String(parts[1] || "").split(",")[0].trim();
+          if (mon && newSpecies) {
+            const dex = await getPokedex();
+            const entry = dex[normalizeName(newSpecies)] || {};
+            mon.species = newSpecies;
+            if (entry.types) mon.types = entry.types;
+            if (entry.abilities) {
+              mon.possibleAbilities = [...new Set(Object.values(entry.abilities))];
+            }
+            if (entry.baseStats && Number.isFinite(entry.baseStats.spe) && mon.level) {
+              mon.predictedSpeed =
+                Math.floor(((2 * entry.baseStats.spe + 85) * mon.level) / 100) + 5;
+            }
+            mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
+            mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
+            // Record the new forme in the revealed tracker too.
+            const map = this.state_.revealed[sideKey(p.side)];
+            if (map) {
+              const key = normalizeName(newSpecies);
+              if (!map[key]) {
+                map[key] = {
+                  species: newSpecies,
+                  nickname: mon.nickname,
+                  level: mon.level,
+                  condition: mon.condition,
+                  ability: mon.ability || null,
+                  usedMoves: [...(mon.usedMoves || [])],
+                  lastSeenTurn: this.state_.turn,
+                };
+              }
+            }
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-weather": {
+        if (inBattle) {
+          const w = parts[0];
+          this.state_.field.weather = !w || w === "none" ? null : w;
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-fieldstart": {
+        if (inBattle) {
+          const name = cleanSideCond(parts[0]);
+          if (name && !this.state_.field.fields.includes(name)) {
+            this.state_.field.fields.push(name);
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-fieldend": {
+        if (inBattle) {
+          const name = cleanSideCond(parts[0]);
+          this.state_.field.fields = this.state_.field.fields.filter((x) => x !== name);
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-sidestart": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const name = cleanSideCond(parts[1]);
+          const side = sideKey(p.side);
+          if (side && name) {
+            const sides = this.state_.field.sides;
+            const arr = sides[side] || (sides[side] = []);
+            const ex = arr.find((x) => x.name === name);
+            // Spikes/Toxic Spikes re-fire this line per layer -> count them.
+            if (ex) ex.count += 1;
+            else arr.push({ name, count: 1 });
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-sideend": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const name = cleanSideCond(parts[1]);
+          const side = sideKey(p.side);
+          if (side && this.state_.field.sides[side]) {
+            this.state_.field.sides[side] = this.state_.field.sides[side].filter(
+              (x) => x.name !== name
+            );
+          }
+        }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "faint": {
-        if (roomId === this.state_.roomId) {
+        if (inBattle) {
           const p = parseIdent(parts[0] || "");
           const mon = this.state_.active[p.side];
           if (mon) mon.condition = "0 fnt";
+          this.syncRevealedCondition(p.side);
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "win": {
-        if (roomId === this.state_.roomId) {
+        if (inBattle) {
           this.state_.ended = true;
           this.state_.request = null;
           this.state_.resultMsg =
@@ -481,7 +800,7 @@ export class BattleSession extends DurableObject {
       }
 
       case "tie": {
-        if (roomId === this.state_.roomId) {
+        if (inBattle) {
           this.state_.ended = true;
           this.state_.request = null;
           this.state_.resultMsg = "The battle ended in a tie.";
@@ -491,7 +810,7 @@ export class BattleSession extends DurableObject {
       }
 
       default: {
-        if (roomId === this.state_.roomId || roomId === "") {
+        if (inBattle || roomId === "") {
           this.pushLog(formatBattleLine(type, parts, mySide));
         }
         break;
@@ -594,11 +913,9 @@ export class BattleSession extends DurableObject {
       if (url.pathname === "/lead") {
         const idx = Number(url.searchParams.get("i") || 0) - 1;
         const req = this.state_.request;
-
         if (req?.teamPreview && this.state_.roomId) {
           const size = req.side?.pokemon?.length || 6;
           const nums = Array.from({ length: size }, (_, i) => i + 1);
-
           if (idx >= 0 && idx < size) {
             const lead = idx + 1;
             const order = [lead, ...nums.filter((n) => n !== lead)].join("");
@@ -613,10 +930,25 @@ export class BattleSession extends DurableObject {
         return Response.redirect(new URL("/battle", url), 302);
       }
 
+      if (url.pathname === "/chat") {
+        // One-line battle chat. Plain text to the room; anything starting
+        // with "/" is blocked so a fat finger can't fire a command.
+        if (request.method === "POST" && this.state_.roomId && !this.state_.ended) {
+          const params = await this.readForm(request);
+          const msg = (params.get("msg") || "").trim().slice(0, 300);
+          if (msg && !msg.startsWith("/")) {
+            try { this.sendToRoom(this.state_.roomId, msg); } catch {}
+          }
+        }
+        return Response.redirect(new URL("/battle", url), 302);
+      }
+
       if (url.pathname === "/moveinfo") {
         const moveId = url.searchParams.get("move") || "";
         const movesData = await getMoves();
-        return this.htmlResponse(renderMoveInfo(movesData[moveId] || null, moveId));
+        return this.htmlResponse(
+          renderMoveInfo(movesData[moveId] || null, moveId, this.state_)
+        );
       }
 
       if (url.pathname === "/timer") {
@@ -674,11 +1006,9 @@ export class BattleSession extends DurableObject {
         return this.htmlResponse(renderBattle(this.state_));
       }
 
-      // Both `notice` and `loginError` are one-shot flash messages (e.g.
-      // "Searching for gen9randombattle...", "Login error: ..."). Render
+      // Both `notice` and `loginError` are one-shot flash messages. Render
       // them once, then clear + persist so they don't linger on every
-      // future page load/refresh - that stale-message bug was the whole
-      // reason "Searching for..." used to stick around forever.
+      // future page load/refresh.
       const homeHtml = renderHome(this.state_);
       if (this.state_.notice || this.state_.loginError) {
         this.state_.notice = null;

@@ -1,14 +1,11 @@
 export function splitFrame(text) {
   const rawLines = String(text || "").split("\n");
-
   let roomId = "";
   let lines = rawLines;
-
   if (rawLines[0] && rawLines[0].startsWith(">")) {
     roomId = rawLines[0].slice(1).trim();
     lines = rawLines.slice(1);
   }
-
   return { roomId, lines: lines.filter((l) => l.length > 0) };
 }
 
@@ -42,23 +39,25 @@ export function parseDetails(details) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-
   const species = parts[0] || "";
   const shiny = parts.some((p) => p.toLowerCase() === "shiny");
-
-  return { species, shiny };
+  // Random battles include a level ("Charizard, L82, M"); defaults to 100.
+  let level = 100;
+  for (const p of parts) {
+    const m = p.match(/^L(\d+)$/);
+    if (m) level = Number(m[1]);
+  }
+  return { species, shiny, level };
 }
 
 export function spriteId(species) {
   let s = String(species || "").toLowerCase().trim();
   if (!s) return "";
-
   s = s
     .replace(/♀/g, "f")
     .replace(/♂/g, "m")
     .replace(/'/g, "")
     .replace(/\./g, "");
-
   if (s.includes("-")) {
     return s
       .split("-")
@@ -66,20 +65,17 @@ export function spriteId(species) {
       .filter(Boolean)
       .join("-");
   }
-
   return s.replace(/[^a-z0-9]/g, "");
 }
 
 export function spriteUrl(species, { shiny = false, back = false, anim = false } = {}) {
   const id = spriteId(species);
   if (!id) return null;
-
   const folder = anim
     ? back ? "gen5ani-back" : "gen5ani"
     : back ? "gen5-back" : "gen5";
   const ext = anim ? "gif" : "png";
   const file = shiny ? `${id}-shiny` : id;
-
   return `/sprite/${folder}/${file}.${ext}`;
 }
 
@@ -121,6 +117,11 @@ export function typeEffectiveness(moveType, defenderTypes) {
   return mult;
 }
 
+function stripRank(user) {
+  // Chat idents can carry group symbols ("@Admin", "%Mod") - drop them.
+  return String(user || "").replace(/^[^A-Za-z0-9]+/, "");
+}
+
 export function formatBattleLine(type, parts, mySide = null) {
   const mine = (side) =>
     mySide ? side.startsWith(mySide) : side.startsWith("p1");
@@ -128,7 +129,6 @@ export function formatBattleLine(type, parts, mySide = null) {
   switch (type) {
     case "raw":
       return parts[0];
-
     case "player":
     case "teamsize":
     case "gametype":
@@ -145,11 +145,7 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "L":
     case "n":
     case "N":
-    case "c":
-    case "chat":
     case ":":
-    case "c:":
-    case "-item":
     case "html":
     case "uhtml":
     case "uhtmlchange":
@@ -160,7 +156,11 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "init":
     case "users":
       return null;
-
+    case "c":
+    case "chat":
+      return `${stripRank(parts[0])}: ${parts.slice(1).join("|")}`;
+    case "c:":
+      return `${stripRank(parts[1])}: ${parts.slice(2).join("|")}`;
     case "tier":
       return `Format: ${parts[0]}`;
     case "teampreview":
@@ -169,7 +169,6 @@ export function formatBattleLine(type, parts, mySide = null) {
       return "Battle started!";
     case "turn":
       return `--- Turn ${parts[0]} ---`;
-
     case "move": {
       const src = parseIdent(parts[0]);
       return `${src.name} used ${parts[1]}!`;
@@ -208,6 +207,17 @@ export function formatBattleLine(type, parts, mySide = null) {
       const p = parseIdent(parts[0]);
       return `${p.name}'s ${parts[1]} fell! (-${parts[2]})`;
     }
+    case "-setboost": {
+      const p = parseIdent(parts[0]);
+      const amt = Number(parts[2]) || 0;
+      return `${p.name}'s ${parts[1]} was set to ${amt > 0 ? "+" : ""}${amt}!`;
+    }
+    case "-clearboost": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}'s stat changes were erased!`;
+    }
+    case "-clearallboost":
+      return "All stat changes were cleared!";
     case "-crit":
       return "A critical hit!";
     case "-supereffective":
@@ -250,6 +260,14 @@ export function formatBattleLine(type, parts, mySide = null) {
       const p = parseIdent(parts[0]);
       return `${p.name} used its ${parts[1]}!`;
     }
+    case "-terastallize": {
+      const p = parseIdent(parts[0]);
+      return `${p.name} Terastallized into ${parts[1]}!`;
+    }
+    case "-formechange": {
+      const p = parseIdent(parts[0]);
+      return `${p.name} changed into ${parts[1]}!`;
+    }
     case "win":
       return `${parts[0]} won the battle!`;
     case "tie":
@@ -258,7 +276,6 @@ export function formatBattleLine(type, parts, mySide = null) {
       return `Error: ${parts[0]}`;
     case "message":
       return parts[0];
-
     default:
       return parts.length ? `[${type}] ${parts.join(" ")}` : null;
   }
