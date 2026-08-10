@@ -28,7 +28,9 @@ function page(title, body, refresh = 0) {
   // (Karbonn K5000, MOCOR on the HMD 105) isolate interactive targets
   // sequentially and latch onto floated/adjacent elements. Every clickable
   // card below is ONE <a> with its sprite INSIDE the anchor, so the D-pad
-  // can never focus the image separately from the link.
+  // can never focus the image separately from the link. If a browser
+  // ignores CSS entirely, everything degrades to plain stacked text and
+  // still works. All glyphs are plain ASCII for ancient font stacks.
   return `<!doctype html>
 <html>
 <head>
@@ -48,7 +50,7 @@ a.row{display:block;border:1px solid #444;border-radius:6px;padding:6px;margin:6
 a.row img{display:block;margin:0 auto 4px}
 .log{font-size:13px;border:1px solid #333;border-radius:6px;padding:6px}
 input[type=text],input[type=password],select{font-size:16px;width:92%}
-button{font-size:16px}
+input[type=submit]{font-size:16px}
 form{margin:6px 0}
 hr{border:0;border-top:1px solid #333;margin:10px 0}
 </style>
@@ -88,6 +90,7 @@ const BOOST_LABELS = {
   evasion: "Eva",
 };
 
+// "+1 Def, -2 Spe" chip next to the HP bar; empty when nothing is staged.
 function boostsLine(boosts) {
   if (!boosts) return "";
   const parts = Object.entries(boosts)
@@ -123,8 +126,10 @@ function describeMultiplier(mult) {
   return `${mult}x - barely scratches`;
 }
 
+// ASCII "x" on purpose: the multiplication sign glyph is missing from some
+// ancient feature-phone fonts.
 function multShort(mult) {
-  return mult === 0 ? "×0" : `×${mult}`;
+  return mult === 0 ? "x0" : `x${mult}`;
 }
 
 const WEATHER_NAMES = {
@@ -207,9 +212,9 @@ function renderRevealed(state) {
   for (const e of entries) {
     const isActive =
       oppActive && e.species === oppActive.species && oppActive.condition !== "0 fnt";
-    body += `<div>&bull; ${esc(e.species)}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
+    body += `<div>- ${esc(e.species)}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
       isActive ? " <strong>(active)</strong>" : ""
-    } &mdash; ${hpBar(e.condition) || "&mdash;"}${
+    } - ${hpBar(e.condition) || "-"}${
       e.ability ? ` <span class="muted">[${esc(e.ability)}]</span>` : ""
     }</div>`;
   }
@@ -227,14 +232,16 @@ function renderField(state) {
   for (const t of f.fields || []) chips.push(t);
 
   const sideLine = (side) =>
-    (f.sides?.[side] || []).map((s) => (s.count > 1 ? `${s.name} ×${s.count}` : s.name));
+    (f.sides?.[side] || []).map((s) => (s.count > 1 ? `${s.name} x${s.count}` : s.name));
   const mine = sideLine(mySide);
   const opp = sideLine(oppSide);
 
   if (!chips.length && !mine.length && !opp.length) return "";
 
   let html = `<h2>Field</h2>`;
-  if (chips.length) html += `<div>${chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`;
+  if (chips.length) {
+    html += `<div>${chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`;
+  }
   if (mine.length) html += `<div>Your side: ${mine.map(esc).join(", ")}</div>`;
   if (opp.length) html += `<div>Opponent's side: ${opp.map(esc).join(", ")}</div>`;
   return html;
@@ -286,6 +293,8 @@ function renderTypeMatchup(state) {
   return body;
 }
 
+// A move's shortDesc under its link, truncated defensively, with a "More"
+// link to the full /moveinfo page (no client JS, so no expand/collapse).
 function renderMoveDesc(m) {
   if (!m.shortDesc) return "";
   const text = m.shortDesc.length > 90 ? `${m.shortDesc.slice(0, 87)}...` : m.shortDesc;
@@ -326,7 +335,7 @@ function renderChallenges(state) {
   const incoming = Object.entries(state.challengesFrom || {});
   for (const [userid, format] of incoming) {
     body += `<div>${esc(userid)} challenged you to ${esc(format)}</div>`;
-    body += `<div><a href="/accept?user=${encodeURIComponent(userid)}">Accept</a> &middot; <a href="/reject?user=${encodeURIComponent(userid)}">Reject</a></div>`;
+    body += `<div><a href="/accept?user=${encodeURIComponent(userid)}">Accept</a> | <a href="/reject?user=${encodeURIComponent(userid)}">Reject</a></div>`;
   }
 
   if (state.challengeTo && state.challengeTo.to) {
@@ -340,7 +349,7 @@ function renderChallenges(state) {
 <div><label>Format<br><select name="format">${RANDOM_FORMATS.map(
       ([id, label]) => `<option value="${esc(id)}">${esc(label)}</option>`
     ).join("")}</select></label></div>
-<div><button type="submit">Challenge</button></div>
+<div><input type="submit" value="Challenge"></div>
 </form>`;
   }
 
@@ -357,7 +366,7 @@ export function renderHome(state) {
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p>Login error: ${esc(state.loginError)}</p>`;
 
-  body += `<p><a href="/">Refresh</a> &middot; <a href="/login">Login</a> &middot; <a href="/logout">Logout</a> &middot; <a href="/reconnect">Reconnect</a></p>`;
+  body += `<p><a href="/">Refresh</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -368,7 +377,7 @@ export function renderHome(state) {
   if (state.searching && state.searching.length) {
     body += `<h2>Searching</h2>`;
     body += `<div>${esc(state.searching.join(", "))}</div>`;
-    body += `<p><a href="/">Check again</a> &middot; <a href="/cancelsearch">Cancel search</a></p>`;
+    body += `<p><a href="/">Check again</a> | <a href="/cancelsearch">Cancel search</a></p>`;
   } else {
     body += `<h2>Random battles</h2>`;
     for (const [id, label] of RANDOM_FORMATS) {
@@ -400,7 +409,7 @@ export function renderLogin(state) {
 <div><label>Username<br><input type="text" name="username"></label></div>
 <div><label>Password<br><input type="password" name="password"></label></div>
 <p class="muted">Warning: this worker can see your password while processing login. Use only on your own personal deployment.</p>
-<div><button type="submit">Login</button></div>
+<div><input type="submit" value="Login"></div>
 </form>
 <p><a href="/">Back</a></p>`;
 
@@ -425,17 +434,19 @@ export function renderBattle(state) {
 
   body += `<h2>Log</h2>${renderLog(state.log)}`;
 
+  // One-line battle chat. Plain text only; "/"-prefixed commands are
+  // blocked server-side so a fat finger can't fire one.
   if (!state.ended && state.roomId) {
     body += `<form method="post" action="/chat">
 <input type="text" name="msg" maxlength="200">
-<button type="submit">Send chat</button>
+<input type="submit" value="Send chat">
 </form>`;
   }
 
   if (state.ended) {
     body += `<h2>Result</h2>`;
     body += `<div>${esc(state.resultMsg || "Battle ended.")}</div>`;
-    body += `<p><a href="/newgame">Start another battle</a> &middot; <a href="/">Home</a></p>`;
+    body += `<p><a href="/newgame">Start another battle</a> | <a href="/">Home</a></p>`;
     return page(state.roomTitle || "Battle", body, 0);
   }
 
@@ -468,7 +479,7 @@ export function renderBattle(state) {
 
       const moves = req.active[0]?.moves || [];
       body += `<h2>Choose a move</h2>`;
-      body += `<div class="muted">The ×N chip is type effectiveness vs the opponent's current type.</div>`;
+      body += `<div class="muted">The xN chip is type effectiveness vs the opponent's current type.</div>`;
       moves.forEach((m, i) => {
         const typeStr = m.type ? ` [${esc(m.type)}]` : "";
         const effChip =
@@ -503,7 +514,7 @@ export function renderBattle(state) {
     body += `<p>Waiting for the next request from the server...</p>`;
   }
 
-  body += `<p><a href="/battle">Refresh</a> &middot; <a href="/timer">Toggle timer</a> &middot; <a href="/forfeit">Forfeit</a> &middot; <a href="/">Home</a></p>`;
+  body += `<p><a href="/battle">Refresh</a> | <a href="/timer">Toggle timer</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -526,7 +537,7 @@ export function renderMoveInfo(move, moveId, state) {
 
   let body = `<h1>${esc(move.name || moveId)}</h1>`;
   body += `<div>${esc(move.type || "")}${move.category ? ` / ${esc(move.category)}` : ""}</div>`;
-  body += `<div>Power: ${esc(String(power))} &middot; Accuracy: ${esc(String(accuracy))} &middot; PP: ${esc(
+  body += `<div>Power: ${esc(String(power))} | Accuracy: ${esc(String(accuracy))} | PP: ${esc(
     String(move.pp ?? "?")
   )}</div>`;
 
