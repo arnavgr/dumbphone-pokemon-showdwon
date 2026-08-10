@@ -95,6 +95,18 @@ function statsLine(stats) {
   return `${stats.atk}/${stats.def}/${stats.spa}/${stats.spd}/${stats.spe}`;
 }
 
+// Boost stages line for active Pokemon
+function boostLine(boosts) {
+  if (!boosts) return null;
+  const parts = [];
+  if (boosts.atk !== 0) parts.push(`${boosts.atk > 0 ? '+' : ''}${boosts.atk} Atk`);
+  if (boosts.def !== 0) parts.push(`${boosts.def > 0 ? '+' : ''}${boosts.def} Def`);
+  if (boosts.spa !== 0) parts.push(`${boosts.spa > 0 ? '+' : ''}${boosts.spa} SpA`);
+  if (boosts.spd !== 0) parts.push(`${boosts.spd > 0 ? '+' : ''}${boosts.spd} SpD`);
+  if (boosts.spe !== 0) parts.push(`${boosts.spe > 0 ? '+' : ''}${boosts.spe} Spe`);
+  return parts.length ? parts.join(', ') : null;
+}
+
 function describeMultiplier(mult) {
   if (mult === 0) return "no effect";
   if (mult >= 4) return `${mult}x - devastating`;
@@ -135,21 +147,28 @@ function renderActive(state, which) {
 
       const types = info.types && info.types.length ? ` <small>[${esc(info.types.join("/"))}]</small>` : "";
 
+      // Get boost stages for this mon
+      const boosts = state.boosts?.[info.slot] || {};
+      const boostText = boostLine(boosts);
+      const boostHtml = boostText ? `<div class="small" style="color:#0066cc">${esc(boostText)}</div>` : "";
+
       let statsHtml = "";
       if (which === "my" && myActiveStats) {
         statsHtml = `<div class="small statline">Atk/Def/SpA/SpD/Spe: ${esc(statsLine(myActiveStats))}</div>`;
-      } else if (which === "opp" && info.baseStats) {
-        statsHtml = `<div class="small statline">Base stats: ${esc(statsLine(info.baseStats))}</div>`;
+      } else if (which === "opp" && info.predictedSpe !== null) {
+        // Show only predicted speed for opponent, not full base stats
+        statsHtml = `<div class="small statline">Predicted Spe: ${esc(info.predictedSpe)}</div>`;
       }
 
-      return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}${statsHtml}</div>`;
+      return `<div class="mon">${img}<div><strong>${esc(label)}</strong>${nick}${types}</div>${hpBar(info.condition)}${boostHtml}${statsHtml}</div>`;
     })
     .join("");
 }
 
 // "Which of my Pokemon hits this thing hardest" - ranks every non-fainted
 // team member by the best effectiveness multiplier among their known move
-// types against the opponent's active type(s).
+// types against the opponent's active type(s). Only considers damaging moves
+// (not status moves) since we're asking "who hits hardest", not "what types do I have".
 function renderTypeMatchup(state) {
   const req = state.request;
   const teamPokemon = req?.side?.pokemon;
@@ -166,7 +185,8 @@ function renderTypeMatchup(state) {
     .filter((p) => p.condition !== "0 fnt")
     .map((p) => {
       const species = (p.details || "").split(",")[0];
-      const moveTypes = p.moveTypes || [];
+      // Use damagingMoveTypes which excludes status moves
+      const moveTypes = p.damagingMoveTypes || p.moveTypes || [];
       const best = moveTypes.length
         ? Math.max(...moveTypes.map((t) => typeEffectiveness(t, oppTypes)))
         : null;
@@ -313,6 +333,33 @@ export function renderBattle(state) {
 
   if (!state.mySide) body += `<p class="small">Detecting your side...</p>`;
 
+  // Field conditions display
+  const field = state.field || {};
+  const fieldParts = [];
+  if (field.weather) fieldParts.push(`Weather: ${esc(field.weather)}`);
+  if (field.terrain) fieldParts.push(`Terrain: ${esc(field.terrain)}`);
+  const mySideKey = state.mySide === "p2" ? "p2SideConditions" : "p1SideConditions";
+  const oppSideKey = state.mySide === "p2" ? "p1SideConditions" : "p2SideConditions";
+  const mySideConds = field[mySideKey] || [];
+  const oppSideConds = field[oppSideKey] || [];
+  if (mySideConds.length) fieldParts.push(`${esc(mySideConds.join(", "))} (your side)`);
+  if (oppSideConds.length) fieldParts.push(`${esc(oppSideConds.join(", "))} (opponent's side)`);
+  if (fieldParts.length) {
+    body += `<p class="small"><strong>Field:</strong> ${esc(fieldParts.join(", "))}</p>`;
+  }
+
+  // Opponent's revealed team tracker
+  if (state.oppTeam && state.oppTeam.length) {
+    body += `<h2>Opponent's revealed team</h2>`;
+    for (const mon of state.oppTeam) {
+      const dexId = normalizeName(mon.species);
+      // Types are already on the active object from upsertActive
+      const types = mon.types || [];
+      const typesText = types.length ? ` <small>[${esc(types.join("/"))}]</small>` : "";
+      body += `<div class="mon"><strong>${esc(mon.species)}</strong>${typesText}<br><small>${esc(mon.condition || "unknown")}</small></div>`;
+    }
+  }
+
   body += `<h2>You</h2>`;
   body += renderActive(state, "my");
   body += `<h2>Opponent</h2>`;
@@ -321,6 +368,10 @@ export function renderBattle(state) {
   body += renderTypeMatchup(state);
 
   body += `<div class="log">${renderLog(state.log)}</div>`;
+
+  // Chat box for friend battles
+  body += `<h2>Chat</h2>`;
+  body += `<form method="post" action="/chat"><input name="message" maxlength="200"><input type="submit" value="Send"></form>`;
 
   if (state.ended) {
     body += `<h2>Result</h2>`;
@@ -342,9 +393,11 @@ export function renderBattle(state) {
         const imgUrl = spriteUrl(species, { anim: false });
         const stats = statsLine(p.stats);
 
+        // For micro-browsers with D-pad navigation issues, wrap the entire row in a single anchor
+        // instead of having separate image and text elements that can cause tab focus problems.
         body += `<a href="/lead?i=${i + 1}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
-            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40" alt=""></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
               <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
@@ -364,9 +417,11 @@ export function renderBattle(state) {
         const imgUrl = spriteUrl(species, { anim: false });
         const stats = statsLine(p.stats);
 
+        // For micro-browsers with D-pad navigation issues, wrap the entire row in a single anchor
+        // instead of having separate image and text elements that can cause tab focus problems.
         body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
-            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40" alt=""></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${i + 1}. ${esc(species)}</strong> (${esc(p.condition || "")})<br>
               <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
@@ -379,15 +434,33 @@ export function renderBattle(state) {
         body += `<p class="small">Doubles: this UI picks for the first active slot, or use default.</p>`;
       }
 
+      // Get opponent's active types for move effectiveness calculation
+      const oppInfo = activeForSide(state, "opp")[0];
+      const oppTypes = oppInfo?.types || [];
+
       const moves = req.active[0]?.moves || [];
       body += `<h2>Choose a move</h2>`;
       moves.forEach((m, i) => {
         const typeStr = m.type ? ` [${esc(m.type)}]` : "";
+        // Calculate effectiveness against opponent (only for damaging moves with known type)
+        let effText = "";
+        if (m.type && oppTypes.length) {
+          const isStatusMove = m.category === "Status" || !m.basePower || m.basePower === 0;
+          if (!isStatusMove) {
+            const mult = typeEffectiveness(m.type, oppTypes);
+            if (mult === 0) effText = ` <small>(immune)</small>`;
+            else if (mult >= 4) effText = ` <small>(devastating)</small>`;
+            else if (mult === 2) effText = ` <small>(super effective)</small>`;
+            else if (mult === 1) effText = ` <small>(neutral)</small>`;
+            else if (mult === 0.5) effText = ` <small>(resisted)</small>`;
+            else if (mult > 0 && mult < 1) effText = ` <small>(barely scratches)</small>`;
+          }
+        }
         if (m.disabled) {
-          body += `<p>${i + 1}. ${esc(m.move)}${typeStr} (disabled)</p>`;
+          body += `<p>${i + 1}. ${esc(m.move)}${typeStr}${effText} (disabled)</p>`;
         } else {
           const href = `/choose?value=${encodeURIComponent(`move ${i + 1}`)}`;
-          body += `<a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr} (${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</a>`;
+          body += `<a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr}${effText} (${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</a>`;
         }
         body += renderMoveDesc(m);
       });
@@ -403,9 +476,11 @@ export function renderBattle(state) {
         const imgUrl = spriteUrl(species, { anim: false });
         const stats = statsLine(p.stats);
 
+        // For micro-browsers with D-pad navigation issues, wrap the entire row in a single anchor
+        // instead of having separate image and text elements that can cause tab focus problems.
         body += `<a href="${esc(href)}" style="display:block; border:1px solid #ccc; padding:2px; text-decoration:none; color:inherit;">
           <table border="0" cellpadding="0" cellspacing="0"><tr>
-            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40"></td>
+            <td valign="middle"><img src="${esc(imgUrl)}" width="40" height="40" alt=""></td>
             <td valign="middle" style="padding-left:4px;">
               <strong>${esc(species)}</strong> (${esc(p.condition || "")})<br>
               <small>${typesText}</small>${stats ? `<br><small>${esc(stats)}</small>` : ""}
