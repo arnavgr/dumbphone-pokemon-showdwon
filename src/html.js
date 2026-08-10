@@ -1,4 +1,4 @@
-import { spriteUrl, typeEffectiveness } from "./protocol.js";
+import { spriteUrl, typeEffectiveness, normalizeName } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 

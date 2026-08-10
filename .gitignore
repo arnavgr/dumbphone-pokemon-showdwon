@@ -1,19 +1,13 @@
 ```
-# Compiled and build artifacts
-*.pyc
-__pycache__/
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
+# Wrangler state and temporary files
+.wrangler/state/
+.wrangler/tmp/
 
 # Dependencies
 node_modules/
-venv/
-.venv/
+package-lock.json
+
+# Environment
 .env
 .env.local
 .env.*
@@ -21,51 +15,12 @@ venv/
 # Logs and temp files
 *.log
 *.tmp
-*.swp
-*.swo
 
 # Editors
 .vscode/
 .idea/
 
-# Build directories
-dist/
-build/
-target/
-*.class
-
-# Python specific
-.mypy_cache/
-.pytest_cache/
-.coverage
-coverage/
-htmlcov/
-
-# System files
-.DS_Store
-Thumbs.db
-
-# Compressed files
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+# SQLite WAL files
+*.sqlite-shm
+*.sqlite-wal
 ```
