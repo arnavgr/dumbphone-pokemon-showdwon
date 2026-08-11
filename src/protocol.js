@@ -41,7 +41,6 @@ export function parseDetails(details) {
     .filter(Boolean);
   const species = parts[0] || "";
   const shiny = parts.some((p) => p.toLowerCase() === "shiny");
-  // Random battles include a level ("Charizard, L82, M"); defaults to 100.
   let level = 100;
   for (const p of parts) {
     const m = p.match(/^L(\d+)$/);
@@ -79,9 +78,6 @@ export function spriteUrl(species, { shiny = false, back = false, anim = false }
   return `/sprite/${folder}/${file}.${ext}`;
 }
 
-// Standard type chart (Gen 6 onward, unchanged through Gen 9). Keyed by
-// ATTACKING type -> {DEFENDING type: multiplier}. Any pair not listed is a
-// neutral 1x hit, so only the non-1x interactions are spelled out here.
 export const TYPE_CHART = {
   Normal: { Rock: 0.5, Ghost: 0, Steel: 0.5 },
   Fire: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 2, Bug: 2, Rock: 0.5, Dragon: 0.5, Steel: 2 },
@@ -103,9 +99,6 @@ export const TYPE_CHART = {
   Fairy: { Fire: 0.5, Fighting: 2, Poison: 0.5, Dragon: 2, Dark: 2, Steel: 0.5 },
 };
 
-// Effectiveness multiplier of a move's type against one or more defending
-// types (e.g. ["Fire", "Flying"]). Missing/unknown types are treated as
-// neutral so a partially-loaded Pokedex entry never throws.
 export function typeEffectiveness(moveType, defenderTypes) {
   if (!moveType) return 1;
   const chart = TYPE_CHART[moveType];
@@ -118,7 +111,6 @@ export function typeEffectiveness(moveType, defenderTypes) {
 }
 
 function stripRank(user) {
-  // Chat idents can carry group symbols ("@Admin", "%Mod") - drop them.
   return String(user || "").replace(/^[^A-Za-z0-9]+/, "");
 }
 
@@ -137,8 +129,6 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "clearpoke":
     case "poke":
     case "upkeep":
-    case "inactive":
-    case "inactiveoff":
     case "j":
     case "J":
     case "l":
@@ -161,6 +151,10 @@ export function formatBattleLine(type, parts, mySide = null) {
       return `${stripRank(parts[0])}: ${parts.slice(1).join("|")}`;
     case "c:":
       return `${stripRank(parts[1])}: ${parts.slice(2).join("|")}`;
+    case "inactive":
+      return "Timer: ON";
+    case "inactiveoff":
+      return "Timer: OFF";
     case "tier":
       return `Format: ${parts[0]}`;
     case "teampreview":
@@ -256,9 +250,13 @@ export function formatBattleLine(type, parts, mySide = null) {
       const p = parseIdent(parts[0]);
       return `${p.name}'s ability: ${parts[1]}`;
     }
+    case "-item": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}'s item: ${parts[1]}`;
+    }
     case "-enditem": {
       const p = parseIdent(parts[0]);
-      return `${p.name} used its ${parts[1]}!`;
+      return `${p.name}'s ${parts[1]} was used up.`;
     }
     case "-terastallize": {
       const p = parseIdent(parts[0]);

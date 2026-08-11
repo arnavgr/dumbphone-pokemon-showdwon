@@ -21,8 +21,7 @@ const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
 const ANIMATED_SPRITES = true;
 
 // ---------------------------------------------------------------------------
-// Global Data Caches: Persist across DO invocations in the V8 isolate.
-// We use Singleton Promises to prevent duplicate 2MB downloads on cold starts.
+// Global Data Caches
 // ---------------------------------------------------------------------------
 let pokedexCache = null;
 let pokedexPromise = null;
@@ -50,13 +49,10 @@ async function getMoves() {
   return movesPromise;
 }
 
-// "|-sidestart|p1: Foo|move: Stealth Rock" -> "Stealth Rock"
 function cleanSideCond(s) {
   return String(s || "").replace(/^move:\s*/i, "").trim();
 }
 
-// Idents come in as full slots ("p2a: X"); revealed/field maps are keyed by
-// the bare side ("p2") so lookups work no matter which slot is active.
 function sideKey(side) {
   return String(side || "").slice(0, 2);
 }
@@ -71,23 +67,27 @@ const DEFAULT_STATE = {
   roomId: null,
   roomTitle: null,
   log: [],
+  chat: [],
   request: null,
   searching: [],
   turn: 0,
   ended: false,
+  timerOn: false,
   resultMsg: null,
   challstr: null,
   notice: null,
   loginError: null,
   upstreamCookie: null,
-  // {userid: format} of challenges other people have sent you
   challengesFrom: {},
-  // {to, format} if you're currently challenging someone, else null
   challengeTo: null,
-  // Persistent "opponent has shown" tracker:
+  // Saved account credentials so a fresh socket can silently re-login.
+  // Deliberately persisted: the DO's websocket dies whenever the isolate
+  // idles, and without re-auth the next search would run as a guest.
+  loginName: null,
+  loginPassword: null,
   // side ("p1"/"p2") -> normalized species -> revealed info
   revealed: {},
-  // Persistent field state (weather / terrains / per-side conditions)
+  // weather / terrains / per-side conditions
   field: { weather: null, fields: [], sides: {} },
 };
 
@@ -99,6 +99,9 @@ export class BattleSession extends DurableObject {
     this.ws = null;
     this.state_ = null;
     this.keepAliveInterval = null;
+    this.pendingAuth = null;
+    this.relogPromise = null;
+    this.relogDisabled = false;
 
     this.ctx.blockConcurrencyWhile(async () => {
       const saved = await this.ctx.storage.get("state");
@@ -106,6 +109,8 @@ export class BattleSession extends DurableObject {
       if (!this.state_.players) this.state_.players = {};
       if (!this.state_.active) this.state_.active = {};
       if (!this.state_.challengesFrom) this.state_.challengesFrom = {};
+      if (!Array.isArray(this.state_.chat)) this.state_.chat = [];
+      if (!Array.isArray(this.state_.log)) this.state_.log = [];
       if (!this.state_.revealed) this.state_.revealed = {};
       if (!this.state_.field) this.state_.field = { weather: null, fields: [], sides: {} };
       if (!this.state_.field.fields) this.state_.field.fields = [];
@@ -125,14 +130,24 @@ export class BattleSession extends DurableObject {
     }
   }
 
+  pushChat(line) {
+    if (!line) return;
+    this.state_.chat.push(line);
+    if (this.state_.chat.length > 50) {
+      this.state_.chat = this.state_.chat.slice(-50);
+    }
+  }
+
   resetBattle() {
     Object.assign(this.state_, {
       roomId: null,
       roomTitle: null,
       log: [],
+      chat: [],
       request: null,
       turn: 0,
       ended: false,
+      timerOn: false,
       resultMsg: null,
       mySide: null,
       players: {},
@@ -176,11 +191,8 @@ export class BattleSession extends DurableObject {
     const entry = dex[id] || {};
     const types = entry.types || [];
 
-    // Showdown never sends the opponent's real computed stats (only your own
-    // team, via |request|), so for them we estimate Spe from the Pokedex
-    // using the standard random-battle spread: 85 IVs, 0 EVs, neutral nature,
-    // scaled by the level from the switch-in details line. Clearly labeled
-    // "predicted" in the UI, never presented as exact.
+    // Predicted Spe for the opponent panel: standard random-battle spread
+    // (85 IVs, 0 EVs, neutral nature), scaled by the level shown on switch-in.
     const baseStats = entry.baseStats || null;
     let predictedSpeed = null;
     if (baseStats && Number.isFinite(baseStats.spe) && level) {
@@ -201,8 +213,9 @@ export class BattleSession extends DurableObject {
       predictedSpeed,
       possibleAbilities,
       ability: null,
+      item: null,
       usedMoves: [],
-      boosts: {}, // fresh object = boosts naturally reset on switch-in
+      boosts: {},
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
       spriteBack: spriteUrl(species, { shiny, back: true, anim: ANIMATED_SPRITES }),
     };
@@ -230,6 +243,7 @@ export class BattleSession extends DurableObject {
       level,
       condition: parts[2] || existing?.condition || "",
       ability: existing?.ability || null,
+      item: existing?.item || null,
       usedMoves: existing?.usedMoves || [],
       lastSeenTurn: this.state_.turn,
     };
@@ -242,9 +256,16 @@ export class BattleSession extends DurableObject {
     if (!entry) return;
     entry.condition = mon.condition;
     if (mon.ability) entry.ability = mon.ability;
+    if (mon.item) entry.item = mon.item;
   }
 
-  // --- Boost helpers --------------------------------------------------------
+  revealMonDetail(side, field, value) {
+    const mon = this.state_.active[side];
+    if (!mon) return;
+    mon[field] = value;
+    const entry = this.state_.revealed[sideKey(side)]?.[normalizeName(mon.species)];
+    if (entry) entry[field] = value;
+  }
 
   adjustBoosts(parts, mode) {
     const p = parseIdent(parts[0] || "");
@@ -297,16 +318,40 @@ export class BattleSession extends DurableObject {
     const assertion =
       action?.assertion || data?.assertion || action?.data?.assertion || null;
     if (!assertion) {
-      throw new Error(
-        action?.actionerror || data?.actionerror || "Login failed."
-      );
+      throw new Error(action?.actionerror || data?.actionerror || "Login failed.");
     }
     const finalName = action?.username || username;
     this.send(`|/trn ${finalName},0,${assertion}`);
     this.state_.username = finalName;
     this.state_.loggedIn = true;
     this.state_.loginError = null;
+    this.state_.loginName = username;
+    this.state_.loginPassword = password;
+    this.relogDisabled = false;
     this.state_.notice = "Logged in.";
+  }
+
+  // Silent re-login after a socket reconnect. All callers share one promise
+  // so concurrent triggers (challstr + updateuser + pendingAuth) can't
+  // double-fire, and a failed attempt disables retries until a manual login.
+  async autoRelogin() {
+    if (this.relogDisabled) return;
+    const { loginName, loginPassword } = this.state_;
+    if (!loginName || !loginPassword) return;
+    if (!this.relogPromise) {
+      this.relogPromise = (async () => {
+        try {
+          await this.login(loginName, loginPassword);
+          this.pushLog(`(logged back in as ${loginName})`);
+        } catch (err) {
+          this.relogDisabled = true;
+          this.pushLog(`(auto-login failed: ${err.message || err})`);
+        } finally {
+          this.relogPromise = null;
+        }
+      })();
+    }
+    return this.relogPromise;
   }
 
   async ensureConnected() {
@@ -342,6 +387,13 @@ export class BattleSession extends DurableObject {
     ws.accept();
     if (this.state_.roomId && !this.state_.ended) {
       ws.send(`|/join ${this.state_.roomId}`);
+    }
+
+    // A brand-new socket is always an anonymous guest session. If we have
+    // saved credentials, re-auth immediately so identity-sensitive commands
+    // (search/challenge/accept) don't fire as Guest.
+    if (this.state_.loginName && this.state_.loginPassword) {
+      this.pendingAuth = this.autoRelogin();
     }
 
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
@@ -421,8 +473,14 @@ export class BattleSession extends DurableObject {
       case "updateuser": {
         const rawName = parts[0] || "";
         const name = rawName.trim().replace(/^[^A-Za-z0-9]+/, "");
+        const isGuest = /^guest/i.test(name);
         this.state_.username = name;
-        this.state_.loggedIn = !/^guest/i.test(name);
+        this.state_.loggedIn = !isGuest;
+        // Demoted to guest mid-session (e.g. after a silent reconnect) while
+        // we hold credentials -> re-auth instead of staying logged out.
+        if (isGuest && this.state_.loginName && this.state_.loginPassword) {
+          await this.autoRelogin();
+        }
         this.detectMySide();
         break;
       }
@@ -436,8 +494,6 @@ export class BattleSession extends DurableObject {
       }
 
       case "updatesearch": {
-        // Fired for ALL games the user is in - both matchmaking AND
-        // accepted friend challenges - so this one handler covers both.
         try {
           const json = JSON.parse(parts[0]);
           this.state_.searching = json.searching || [];
@@ -470,10 +526,16 @@ export class BattleSession extends DurableObject {
 
       case "request": {
         if (!inBattle) break;
-        if (!parts[0] || parts[0] === "null") { this.state_.request = null; break; }
+        if (!parts[0] || parts[0] === "null") {
+          this.state_.request = null;
+          break;
+        }
         try {
           const req = JSON.parse(parts[0]);
-          if (!req) { this.state_.request = null; break; }
+          if (!req) {
+            this.state_.request = null;
+            break;
+          }
           const side = String(
             req?.side?.id || req?.side?.pokemon?.[0]?.ident || ""
           ).slice(0, 2);
@@ -482,10 +544,8 @@ export class BattleSession extends DurableObject {
           const dex = await getPokedex();
           const movesData = await getMoves();
 
-          // Append type data to swappable Pokemon array. moveTypes only
-          // includes DAMAGING moves (category !== Status, basePower > 0) -
-          // a Will-O-Wisp's Fire typing used to pollute the "who hits
-          // hardest" ranking, which makes no sense.
+          // moveTypes only counts DAMAGING moves (status moves excluded),
+          // which is what powers the "who hits hardest" ranking.
           if (req.side && req.side.pokemon) {
             for (const p of req.side.pokemon) {
               const species = String(p.details || "").split(",")[0].trim();
@@ -506,9 +566,9 @@ export class BattleSession extends DurableObject {
             }
           }
 
-          // Enrich active move choices: type, shortDesc, and effectiveness
-          // vs the opponent's CURRENT types (tera-aware, since
-          // -terastallize rewrites active.types).
+          // Enrich active move choices; attach effectiveness vs the
+          // opponent's CURRENT types (tera-aware). req.active[0] also
+          // carries canTerastallize, which the UI renders as extra links.
           const oppTypes = this.oppActiveInfo()?.types || [];
           if (req.active) {
             for (const active of req.active) {
@@ -546,7 +606,7 @@ export class BattleSession extends DurableObject {
       case "drag": {
         if (inBattle) {
           await this.upsertActive(parts);
-          this.trackRevealed(parts); // accumulate opponent's (and our) shown mons
+          this.trackRevealed(parts);
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
@@ -554,7 +614,6 @@ export class BattleSession extends DurableObject {
 
       case "move": {
         if (inBattle) {
-          // Track used moves so the UI can show "seen moves" per mon.
           const p = parseIdent(parts[0] || "");
           const mon = this.state_.active[p.side];
           const mv = parts[1];
@@ -645,13 +704,26 @@ export class BattleSession extends DurableObject {
       case "-ability": {
         if (inBattle) {
           const p = parseIdent(parts[0] || "");
-          const mon = this.state_.active[p.side];
-          if (mon && parts[1]) {
-            mon.ability = parts[1];
-            const entry =
-              this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
-            if (entry) entry.ability = parts[1];
-          }
+          if (parts[1]) this.revealMonDetail(p.side, "ability", parts[1]);
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-item": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          if (parts[1]) this.revealMonDetail(p.side, "item", parts[1]);
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-enditem": {
+        // Consumed / knocked off -> the mon no longer holds it.
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          this.revealMonDetail(p.side, "item", null);
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
@@ -659,7 +731,6 @@ export class BattleSession extends DurableObject {
 
       case "-terastallize": {
         if (inBattle) {
-          // Tera rewrites the mon's defensive typing - keep matchup math right.
           const p = parseIdent(parts[0] || "");
           const mon = this.state_.active[p.side];
           const teraType = parts[1];
@@ -691,7 +762,6 @@ export class BattleSession extends DurableObject {
             }
             mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
             mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
-            // Record the new forme in the revealed tracker too.
             const map = this.state_.revealed[sideKey(p.side)];
             if (map) {
               const key = normalizeName(newSpecies);
@@ -702,6 +772,7 @@ export class BattleSession extends DurableObject {
                   level: mon.level,
                   condition: mon.condition,
                   ability: mon.ability || null,
+                  item: mon.item || null,
                   usedMoves: [...(mon.usedMoves || [])],
                   lastSeenTurn: this.state_.turn,
                 };
@@ -751,7 +822,6 @@ export class BattleSession extends DurableObject {
             const sides = this.state_.field.sides;
             const arr = sides[side] || (sides[side] = []);
             const ex = arr.find((x) => x.name === name);
-            // Spikes/Toxic Spikes re-fire this line per layer -> count them.
             if (ex) ex.count += 1;
             else arr.push({ name, count: 1 });
           }
@@ -772,6 +842,31 @@ export class BattleSession extends DurableObject {
           }
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "inactive": {
+        // Timer upkeep lines fire every turn; only log the transition.
+        if (!this.state_.timerOn) {
+          this.state_.timerOn = true;
+          this.pushLog("Timer: ON");
+        }
+        break;
+      }
+
+      case "inactiveoff": {
+        if (this.state_.timerOn) {
+          this.state_.timerOn = false;
+          this.pushLog("Timer: OFF");
+        }
+        break;
+      }
+
+      case "c":
+      case "chat":
+      case "c:": {
+        // Chat goes to its own transcript, not the battle log.
+        this.pushChat(formatBattleLine(type, parts, mySide));
         break;
       }
 
@@ -830,12 +925,17 @@ export class BattleSession extends DurableObject {
   async fetch(request) {
     try {
       await this.ensureConnected();
+      // If a reconnect kicked off a silent re-login, wait for it so
+      // identity-sensitive commands below land under the account, not Guest.
+      if (this.pendingAuth) {
+        const p = this.pendingAuth;
+        this.pendingAuth = null;
+        try { await p; } catch {}
+      }
       const url = new URL(request.url);
 
       if (url.pathname === "/search") {
         const format = url.searchParams.get("format") || "gen9randombattle";
-        // Only random formats are offered, and those never need a
-        // user-built team, so we always search with a null team.
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
         this.state_.notice = `Searching for ${format}...`;
@@ -931,8 +1031,6 @@ export class BattleSession extends DurableObject {
       }
 
       if (url.pathname === "/chat") {
-        // One-line battle chat. Plain text to the room; anything starting
-        // with "/" is blocked so a fat finger can't fire a command.
         if (request.method === "POST" && this.state_.roomId && !this.state_.ended) {
           const params = await this.readForm(request);
           const msg = (params.get("msg") || "").trim().slice(0, 300);
@@ -994,7 +1092,10 @@ export class BattleSession extends DurableObject {
         try { this.send("|/logout"); } catch {}
         this.state_.loggedIn = false;
         this.state_.username = null;
+        this.state_.loginName = null;
+        this.state_.loginPassword = null;
         this.state_.mySide = null;
+        this.relogDisabled = false;
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
@@ -1006,9 +1107,6 @@ export class BattleSession extends DurableObject {
         return this.htmlResponse(renderBattle(this.state_));
       }
 
-      // Both `notice` and `loginError` are one-shot flash messages. Render
-      // them once, then clear + persist so they don't linger on every
-      // future page load/refresh.
       const homeHtml = renderHome(this.state_);
       if (this.state_.notice || this.state_.loginError) {
         this.state_.notice = null;

@@ -2,8 +2,6 @@ import { spriteUrl, typeEffectiveness } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
-// Only the random formats worth surfacing on a keypad-only phone: no
-// teambuilder, so only formats that hand you a randomized team belong here.
 const RANDOM_FORMATS = [
   ["gen9randombattle", "Gen 9 Random Battle"],
   ["gen9hackmonscup", "Gen 9 Hackmons Cup"],
@@ -24,13 +22,9 @@ function page(title, body, refresh = 0) {
   const refreshTag =
     refresh > 0 ? `<meta http-equiv="refresh" content="${refresh}">` : "";
 
-  // CSS is deliberately tiny and float-free: micro-browser D-pad engines
-  // (Karbonn K5000, MOCOR on the HMD 105) isolate interactive targets
-  // sequentially and latch onto floated/adjacent elements. Every clickable
-  // card below is ONE <a> with its sprite INSIDE the anchor, so the D-pad
-  // can never focus the image separately from the link. If a browser
-  // ignores CSS entirely, everything degrades to plain stacked text and
-  // still works. All glyphs are plain ASCII for ancient font stacks.
+  // Tiny, float-free CSS: every clickable card is ONE <a> with its sprite
+  // inside the anchor so D-pad engines can't strand focus on the image.
+  // All glyphs are plain ASCII for ancient font stacks.
   return `<!doctype html>
 <html>
 <head>
@@ -63,34 +57,24 @@ ${body}
 
 function hpBar(cond) {
   if (!cond) return "";
-
   if (cond === "0 fnt") {
     return `<span class="hpbar" style="color:#bb2222">fainted</span>`;
   }
-
   const m = String(cond).match(/^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)(?:\s+(.*))?$/);
   if (!m) return `<span class="hpbar">${esc(cond)}</span>`;
-
   const cur = Number(m[1]);
   const max = Number(m[2]);
   const pct = max ? Math.max(0, Math.min(100, Math.round((cur / max) * 100))) : 0;
   const status = m[3] ? ` [${esc(m[3])}]` : "";
   const color = pct > 50 ? "#4caf50" : pct > 20 ? "#cc7700" : "#bb2222";
-
   return `<span class="hpbar" style="color:${color}">${pct}%${status}</span>`;
 }
 
 const BOOST_LABELS = {
-  atk: "Atk",
-  def: "Def",
-  spa: "SpA",
-  spd: "SpD",
-  spe: "Spe",
-  accuracy: "Acc",
-  evasion: "Eva",
+  atk: "Atk", def: "Def", spa: "SpA", spd: "SpD",
+  spe: "Spe", accuracy: "Acc", evasion: "Eva",
 };
 
-// "+1 Def, -2 Spe" chip next to the HP bar; empty when nothing is staged.
 function boostsLine(boosts) {
   if (!boosts) return "";
   const parts = Object.entries(boosts)
@@ -103,15 +87,12 @@ function boostsLine(boosts) {
 function activeForSide(state, which) {
   const mySide = state.mySide || "p1";
   const side = which === "my" ? mySide : mySide === "p1" ? "p2" : "p1";
-
   return Object.entries(state.active || {})
     .filter(([slot]) => slot.startsWith(side))
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, info]) => info);
 }
 
-// Compact "atk/def/spa/spd/spe" string. A legend is printed once per
-// section instead of repeating labels per mon.
 function statsLine(stats) {
   if (!stats) return null;
   return `${stats.atk}/${stats.def}/${stats.spa}/${stats.spd}/${stats.spe}`;
@@ -126,32 +107,25 @@ function describeMultiplier(mult) {
   return `${mult}x - barely scratches`;
 }
 
-// ASCII "x" on purpose: the multiplication sign glyph is missing from some
-// ancient feature-phone fonts.
 function multShort(mult) {
   return mult === 0 ? "x0" : `x${mult}`;
 }
 
 const WEATHER_NAMES = {
-  RainDance: "Rain",
-  SunnyDay: "Sun",
-  Sandstorm: "Sandstorm",
-  Hail: "Hail",
-  Snow: "Snow",
-  DesolateLand: "Harsh Sun",
-  PrimordialSea: "Heavy Rain",
-  DeltaStream: "Strong Winds",
+  RainDance: "Rain", SunnyDay: "Sun", Sandstorm: "Sandstorm",
+  Hail: "Hail", Snow: "Snow", DesolateLand: "Harsh Sun",
+  PrimordialSea: "Heavy Rain", DeltaStream: "Strong Winds",
 };
 
 function renderActive(state, which) {
   const mons = activeForSide(state, which);
   if (!mons.length) return `<div class="muted">?</div>`;
 
-  // Your own active mon's exact stats come from the request; the opponent's
-  // are never sent to you, so we show predicted Spe + possible abilities.
-  const myActiveStats =
+  // Your own active mon's exact stats/ability/item come from the request;
+  // the opponent's never do, so they get predicted Spe + revealed details.
+  const myActiveFull =
     which === "my"
-      ? (state.request?.side?.pokemon || []).find((p) => p.active)?.stats
+      ? (state.request?.side?.pokemon || []).find((p) => p.active)
       : null;
 
   return mons
@@ -160,7 +134,6 @@ function renderActive(state, which) {
         which === "my" && SHOW_BACK_SPRITES_FOR_YOU
           ? info.spriteBack || info.spriteFront
           : info.spriteFront;
-
       const img = url ? `<img src="${esc(url)}" alt="" width="96">` : "";
 
       const label = info.species || info.nickname || "?";
@@ -175,17 +148,22 @@ function renderActive(state, which) {
           : "";
 
       let intel = "";
-      if (which === "my" && myActiveStats) {
-        intel = `<div class="muted">Atk/Def/SpA/SpD/Spe: ${esc(statsLine(myActiveStats))}</div>`;
+      if (which === "my") {
+        if (myActiveFull?.stats) {
+          intel += `<div class="muted">Atk/Def/SpA/SpD/Spe: ${esc(statsLine(myActiveFull.stats))}</div>`;
+        }
+        const bits = [];
+        if (myActiveFull?.ability) bits.push(`Ability: ${myActiveFull.ability}`);
+        if (myActiveFull?.item) bits.push(`Item: ${myActiveFull.item}`);
+        if (bits.length) intel += `<div class="muted">${esc(bits.join(" | "))}</div>`;
       } else if (which === "opp") {
         if (info.ability) {
           intel += `<div>Ability: ${esc(info.ability)} (revealed)</div>`;
         } else if (info.possibleAbilities && info.possibleAbilities.length) {
           intel += `<div class="muted">Possible abilities: ${esc(info.possibleAbilities.join(" / "))}</div>`;
         }
-        if (info.predictedSpeed != null) {
-          intel += `<div>Predicted Spe: ${info.predictedSpeed}</div>`;
-        }
+        if (info.item) intel += `<div>Item: ${esc(info.item)} (revealed)</div>`;
+        if (info.predictedSpeed != null) intel += `<div>Predicted Spe: ${info.predictedSpeed}</div>`;
         if (info.usedMoves && info.usedMoves.length) {
           intel += `<div class="muted">Seen moves: ${esc(info.usedMoves.join(", "))}</div>`;
         }
@@ -197,8 +175,6 @@ function renderActive(state, which) {
     .join("<hr>");
 }
 
-// Persistent "opponent has shown" tracker - every switch/drag we've seen,
-// with last-known HP/status, revealed ability, and an (active) marker.
 function renderRevealed(state) {
   const mySide = state.mySide || "p1";
   const oppSide = mySide === "p1" ? "p2" : "p1";
@@ -212,16 +188,16 @@ function renderRevealed(state) {
   for (const e of entries) {
     const isActive =
       oppActive && e.species === oppActive.species && oppActive.condition !== "0 fnt";
+    const tags = [e.ability, e.item].filter(Boolean).join(" / ");
     body += `<div>- ${esc(e.species)}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
       isActive ? " <strong>(active)</strong>" : ""
     } - ${hpBar(e.condition) || "-"}${
-      e.ability ? ` <span class="muted">[${esc(e.ability)}]</span>` : ""
+      tags ? ` <span class="muted">[${esc(tags)}]</span>` : ""
     }</div>`;
   }
   return body;
 }
 
-// Weather / terrains / entry hazards, persisted (not just log lines).
 function renderField(state) {
   const f = state.field || {};
   const mySide = state.mySide || "p1";
@@ -247,9 +223,6 @@ function renderField(state) {
   return html;
 }
 
-// "Which of my Pokemon hits this thing hardest" - ranks every non-fainted
-// team member by the best effectiveness among their DAMAGING move types
-// (status moves are excluded server-side when moveTypes is built).
 function renderTypeMatchup(state) {
   const req = state.request;
   const teamPokemon = req?.side?.pokemon;
@@ -284,17 +257,13 @@ function renderTypeMatchup(state) {
   for (const r of rows) {
     const label =
       r.best === null
-        ? r.hasMoves
-          ? "no attacking moves known"
-          : "moves unknown"
+        ? r.hasMoves ? "no attacking moves known" : "moves unknown"
         : describeMultiplier(r.best);
     body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: ${esc(label)}</div>`;
   }
   return body;
 }
 
-// A move's shortDesc under its link, truncated defensively, with a "More"
-// link to the full /moveinfo page (no client JS, so no expand/collapse).
 function renderMoveDesc(m) {
   if (!m.shortDesc) return "";
   const text = m.shortDesc.length > 90 ? `${m.shortDesc.slice(0, 87)}...` : m.shortDesc;
@@ -304,20 +273,21 @@ function renderMoveDesc(m) {
   return `<div class="muted">${esc(text)}${moreLink}</div>`;
 }
 
-// One clickable card per switchable mon. IMPORTANT: the sprite lives
-// INSIDE the anchor so keypad D-pad navigation treats image + text as a
-// single selectable target (adjacent-but-separate elements get stranded).
 function switchCard(p, i, href, showNum) {
   const species = (p.details || "").split(",")[0];
   const imgUrl = spriteUrl(species, { anim: false });
   const typesText = p.types && p.types.length ? ` [${esc(p.types.join("/"))}]` : "";
   const stats = statsLine(p.stats);
   const cond = p.condition ? ` ${hpBar(p.condition)}` : "";
+  const bits = [];
+  if (p.ability) bits.push(`Ability: ${p.ability}`);
+  if (p.item) bits.push(`Item: ${p.item}`);
+  const extra = bits.length ? `<br><span class="muted">${esc(bits.join(" | "))}</span>` : "";
   return `<a class="row" href="${esc(href)}">
 <img src="${esc(imgUrl)}" alt="" width="96">
 <span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${
     stats ? `<br><span class="muted">Atk/Def/SpA/SpD/Spe: ${esc(stats)}</span>` : ""
-  }</span>
+  }${extra}</span>
 </a>`;
 }
 
@@ -327,6 +297,24 @@ function renderLog(log) {
     recent.map((l) => `<div>${esc(l)}</div>`).join("") ||
     '<div class="muted">(no messages yet)</div>'
   }</div>`;
+}
+
+// Separate chat transcript: battle lines churn too fast to keep chat
+// interleaved without it scrolling away instantly.
+function renderChat(state) {
+  const lines = (state.chat || []).slice(-15);
+  let body = `<h2>Chat</h2>`;
+  body += `<div class="log">${
+    lines.map((l) => `<div>${esc(l)}</div>`).join("") ||
+    '<div class="muted">(no chat yet)</div>'
+  }</div>`;
+  if (!state.ended && state.roomId) {
+    body += `<form method="post" action="/chat">
+<input type="text" name="msg" maxlength="200">
+<input type="submit" value="Send chat">
+</form>`;
+  }
+  return body;
 }
 
 function renderChallenges(state) {
@@ -408,7 +396,7 @@ export function renderLogin(state) {
   body += `<form method="post" action="/login">
 <div><label>Username<br><input type="text" name="username"></label></div>
 <div><label>Password<br><input type="password" name="password"></label></div>
-<p class="muted">Warning: this worker can see your password while processing login. Use only on your own personal deployment.</p>
+<p class="muted">Warning: this worker stores your password so it can silently re-login after reconnects. Use only on your own personal deployment.</p>
 <div><input type="submit" value="Login"></div>
 </form>
 <p><a href="/">Back</a></p>`;
@@ -419,6 +407,7 @@ export function renderLogin(state) {
 export function renderBattle(state) {
   let body = `<h1>${esc(state.roomTitle || "Battle")}</h1>`;
   body += `<div>Turn ${state.turn || 0}${state.ended ? " - battle over" : ""}</div>`;
+  body += `<div>Timer: <strong>${state.timerOn ? "ON" : "OFF"}</strong></div>`;
 
   if (!state.mySide) body += `<div class="muted">Detecting your side...</div>`;
 
@@ -427,21 +416,12 @@ export function renderBattle(state) {
   body += `<h2>Opponent</h2>`;
   body += renderActive(state, "opp");
 
-  // Near-the-top intel: revealed team, field state, type matchup.
   body += renderRevealed(state);
   body += renderField(state);
   body += renderTypeMatchup(state);
 
   body += `<h2>Log</h2>${renderLog(state.log)}`;
-
-  // One-line battle chat. Plain text only; "/"-prefixed commands are
-  // blocked server-side so a fat finger can't fire one.
-  if (!state.ended && state.roomId) {
-    body += `<form method="post" action="/chat">
-<input type="text" name="msg" maxlength="200">
-<input type="submit" value="Send chat">
-</form>`;
-  }
+  body += renderChat(state);
 
   if (state.ended) {
     body += `<h2>Result</h2>`;
@@ -466,8 +446,7 @@ export function renderBattle(state) {
       (req.side?.pokemon || []).forEach((p, i) => {
         if (p.active || p.condition === "0 fnt") return;
         body += switchCard(
-          p,
-          i,
+          p, i,
           `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`,
           true
         );
@@ -477,7 +456,10 @@ export function renderBattle(state) {
         body += `<div class="muted">Doubles: this UI picks for the first active slot, or use default.</div>`;
       }
 
-      const moves = req.active[0]?.moves || [];
+      const activeReq = req.active[0] || {};
+      const moves = activeReq.moves || [];
+      const canTera = activeReq.canTerastallize;
+
       body += `<h2>Choose a move</h2>`;
       body += `<div class="muted">The xN chip is type effectiveness vs the opponent's current type.</div>`;
       moves.forEach((m, i) => {
@@ -496,13 +478,23 @@ export function renderBattle(state) {
       });
       body += `<p><a href="/choose?value=${encodeURIComponent("default")}">Use default move</a></p>`;
 
+      // Terastallize: same moves, choice gets the "terastallize" suffix.
+      if (canTera) {
+        body += `<h2>Terastallize (${esc(String(canTera))})</h2>`;
+        body += `<div class="muted">Use a move AND Terastallize this turn.</div>`;
+        moves.forEach((m, i) => {
+          if (m.disabled) return;
+          const href = `/choose?value=${encodeURIComponent(`move ${i + 1} terastallize`)}`;
+          body += `<p><a href="${esc(href)}">${i + 1}. ${esc(m.move)} + Tera</a></p>`;
+        });
+      }
+
       body += `<h2>Switch out</h2>`;
       body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
       (req.side?.pokemon || []).forEach((p, i) => {
         if (p.active || p.condition === "0 fnt") return;
         body += switchCard(
-          p,
-          i,
+          p, i,
           `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`,
           false
         );
@@ -514,7 +506,9 @@ export function renderBattle(state) {
     body += `<p>Waiting for the next request from the server...</p>`;
   }
 
-  body += `<p><a href="/battle">Refresh</a> | <a href="/timer">Toggle timer</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
+  body += `<p><a href="/battle">Refresh</a> | <a href="/timer">${
+    state.timerOn ? "Turn timer off" : "Turn timer on"
+  }</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -541,7 +535,6 @@ export function renderMoveInfo(move, moveId, state) {
     String(move.pp ?? "?")
   )}</div>`;
 
-  // Effectiveness vs the opponent's CURRENT active mon (tera-aware).
   const oppInfo = state ? activeForSide(state, "opp")[0] : null;
   const oppTypes = oppInfo?.types;
   if (oppTypes && oppTypes.length) {
