@@ -1,4 +1,4 @@
-# PS CloudPhone
+# Dumbphone-pokemon-showdown
 
 A Pokemon Showdown battle client built for CloudPhone's keypad-only, JS-limited
 browser. It does not reimplement the battle engine -- it connects to the real
