@@ -81,8 +81,8 @@ const DEFAULT_STATE = {
   challengesFrom: {},
   challengeTo: null,
   // Saved account credentials so a fresh socket can silently re-login.
-  // Necessary because the DO's websocket dies whenever the isolate idles,
-  // and a fresh socket is ALWAYS a guest session on Showdown's side.
+  // Deliberately persisted: the DO's websocket dies whenever the isolate
+  // idles, and without re-auth the next search would run as a guest.
   loginName: null,
   loginPassword: null,
   // side ("p1"/"p2") -> normalized species -> revealed info
@@ -102,11 +102,6 @@ export class BattleSession extends DurableObject {
     this.pendingAuth = null;
     this.relogPromise = null;
     this.relogDisabled = false;
-    // Challstr of the LIVE socket only. Assertions are bound to it, so a
-    // stale one from a previous connection makes /trn fail silently.
-    this.connChallstr = null;
-    // login() waiters woken by the confirming |updateuser| line.
-    this.renameWaiters = [];
 
     this.ctx.blockConcurrencyWhile(async () => {
       const saved = await this.ctx.storage.get("state");
@@ -174,13 +169,6 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  // We hold credentials but the live socket never became that user
-  // (re-login failed). Acting as guest here is exactly the bug that
-  // produced "spiddygriddy vs. Guest 22523645".
-  authBroken() {
-    return Boolean(this.state_.loginName) && !this.state_.loggedIn;
-  }
-
   oppSide() {
     const mySide = this.state_.mySide || "p1";
     return mySide === "p1" ? "p2" : "p1";
@@ -203,6 +191,8 @@ export class BattleSession extends DurableObject {
     const entry = dex[id] || {};
     const types = entry.types || [];
 
+    // Predicted Spe for the opponent panel: standard random-battle spread
+    // (85 IVs, 0 EVs, neutral nature), scaled by the level shown on switch-in.
     const baseStats = entry.baseStats || null;
     let predictedSpeed = null;
     if (baseStats && Number.isFinite(baseStats.spe) && level) {
@@ -297,38 +287,18 @@ export class BattleSession extends DurableObject {
     return new URLSearchParams(text);
   }
 
-  // Woken by the |updateuser| handler when the server confirms the rename.
-  waitForRename(name, timeoutMs) {
-    return new Promise((resolve) => {
-      const entry = { name: normalizeName(name), resolve };
-      this.renameWaiters.push(entry);
-      setTimeout(() => {
-        const i = this.renameWaiters.indexOf(entry);
-        if (i !== -1) {
-          this.renameWaiters.splice(i, 1);
-          resolve(false);
-        }
-      }, timeoutMs);
-    });
-  }
-
   async login(username, password) {
-    // /trn MUST use the challstr of the LIVE connection: assertions are
-    // bound to it, and one from a previous socket is silently rejected
-    // (leaving us a guest while the UI claims we're logged in).
-    const deadline = Date.now() + 4000;
-    while (!this.connChallstr && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
+    if (!this.state_.challstr) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
     }
-    if (!this.connChallstr) {
+    if (!this.state_.challstr) {
       throw new Error("No challstr received yet. Refresh and try again.");
     }
-
     const body = new URLSearchParams();
     body.set("act", "login");
     body.set("name", username);
     body.set("pass", password);
-    body.set("challstr", this.connChallstr);
+    body.set("challstr", this.state_.challstr);
 
     const res = await fetch("https://play.pokemonshowdown.com/action.php", {
       method: "POST",
@@ -347,29 +317,11 @@ export class BattleSession extends DurableObject {
     const action = Array.isArray(data?.actions) ? data.actions[0] : data;
     const assertion =
       action?.assertion || data?.assertion || action?.data?.assertion || null;
-
-    // Login-server error assertions start with ";". Without this check a
-    // wrong password still "looked" logged in locally.
-    if (!assertion || String(assertion).startsWith(";")) {
-      throw new Error(
-        (assertion && String(assertion).replace(/^;+/, "")) ||
-          action?.actionerror ||
-          data?.actionerror ||
-          "Login failed."
-      );
+    if (!assertion) {
+      throw new Error(action?.actionerror || data?.actionerror || "Login failed.");
     }
-
     const finalName = action?.username || username;
     this.send(`|/trn ${finalName},0,${assertion}`);
-
-    // Wait for the server to CONFIRM the rename. Without this, a rejected
-    // /trn leaves the socket as a guest and /search quietly creates a
-    // guest battle while every page still shows the account name.
-    const confirmed = await this.waitForRename(finalName, 5000);
-    if (!confirmed) {
-      throw new Error("Server didn't confirm the login (still guest). Try again.");
-    }
-
     this.state_.username = finalName;
     this.state_.loggedIn = true;
     this.state_.loginError = null;
@@ -380,8 +332,8 @@ export class BattleSession extends DurableObject {
   }
 
   // Silent re-login after a socket reconnect. All callers share one promise
-  // so concurrent triggers can't double-fire; a failed attempt disables
-  // retries until the next fresh connection or a manual login.
+  // so concurrent triggers (challstr + updateuser + pendingAuth) can't
+  // double-fire, and a failed attempt disables retries until a manual login.
   async autoRelogin() {
     if (this.relogDisabled) return;
     const { loginName, loginPassword } = this.state_;
@@ -406,10 +358,6 @@ export class BattleSession extends DurableObject {
     if (this.ws && this.ws.readyState === 1 /* OPEN */) {
       return;
     }
-    // New socket -> its challstr hasn't arrived yet. Null it so login()
-    // can never accidentally use the previous connection's.
-    this.connChallstr = null;
-
     if (!this.state_.upstreamCookie) {
       try {
         const infoRes = await fetch("https://sim3.psim.us/showdown/info");
@@ -441,10 +389,9 @@ export class BattleSession extends DurableObject {
       ws.send(`|/join ${this.state_.roomId}`);
     }
 
-    // A brand-new socket is always an anonymous guest session on Showdown's
-    // side, even if our state says "logged in". Re-auth immediately so
-    // identity-sensitive commands don't fire as Guest.
-    this.relogDisabled = false;
+    // A brand-new socket is always an anonymous guest session. If we have
+    // saved credentials, re-auth immediately so identity-sensitive commands
+    // (search/challenge/accept) don't fire as Guest.
     if (this.state_.loginName && this.state_.loginPassword) {
       this.pendingAuth = this.autoRelogin();
     }
@@ -495,7 +442,6 @@ export class BattleSession extends DurableObject {
   async onSocketClose(event) {
     this.ws = null;
     this.state_.connected = false;
-    this.connChallstr = null;
     this.pushLog(`(disconnected from server: ${event.reason || event.code})`);
     await this.save();
   }
@@ -503,7 +449,6 @@ export class BattleSession extends DurableObject {
   async onSocketError() {
     this.ws = null;
     this.state_.connected = false;
-    this.connChallstr = null;
     this.pushLog(`(connection error)`);
     await this.save();
   }
@@ -515,9 +460,7 @@ export class BattleSession extends DurableObject {
 
     switch (type) {
       case "challstr": {
-        // Challstr of THIS connection. login() uses only this one.
-        this.connChallstr = parts.join("|");
-        this.state_.challstr = this.connChallstr;
+        this.state_.challstr = parts.join("|");
         this.state_.connected = true;
         if (this.state_.roomId && !this.state_.ended) {
           try {
@@ -533,22 +476,10 @@ export class BattleSession extends DurableObject {
         const isGuest = /^guest/i.test(name);
         this.state_.username = name;
         this.state_.loggedIn = !isGuest;
-
-        // Wake a pending login() that's waiting for rename confirmation.
-        if (!isGuest && this.renameWaiters.length) {
-          const norm = normalizeName(name);
-          const idx = this.renameWaiters.findIndex((w) => w.name === norm);
-          if (idx !== -1) {
-            const [w] = this.renameWaiters.splice(idx, 1);
-            w.resolve(true);
-          }
-        }
-
-        // Demoted to guest while we hold credentials -> re-auth. Do NOT
-        // await it here: login() blocks on a FUTURE updateuser line, which
-        // can't be processed while this handler holds the line queue.
+        // Demoted to guest mid-session (e.g. after a silent reconnect) while
+        // we hold credentials -> re-auth instead of staying logged out.
         if (isGuest && this.state_.loginName && this.state_.loginPassword) {
-          this.ctx.waitUntil(this.autoRelogin());
+          await this.autoRelogin();
         }
         this.detectMySide();
         break;
@@ -613,6 +544,8 @@ export class BattleSession extends DurableObject {
           const dex = await getPokedex();
           const movesData = await getMoves();
 
+          // moveTypes only counts DAMAGING moves (status moves excluded),
+          // which is what powers the "who hits hardest" ranking.
           if (req.side && req.side.pokemon) {
             for (const p of req.side.pokemon) {
               const species = String(p.details || "").split(",")[0].trim();
@@ -633,6 +566,9 @@ export class BattleSession extends DurableObject {
             }
           }
 
+          // Enrich active move choices; attach effectiveness vs the
+          // opponent's CURRENT types (tera-aware). req.active[0] also
+          // carries canTerastallize, which the UI renders as extra links.
           const oppTypes = this.oppActiveInfo()?.types || [];
           if (req.active) {
             for (const active of req.active) {
@@ -784,6 +720,7 @@ export class BattleSession extends DurableObject {
       }
 
       case "-enditem": {
+        // Consumed / knocked off -> the mon no longer holds it.
         if (inBattle) {
           const p = parseIdent(parts[0] || "");
           this.revealMonDetail(p.side, "item", null);
@@ -909,6 +846,7 @@ export class BattleSession extends DurableObject {
       }
 
       case "inactive": {
+        // Timer upkeep lines fire every turn; only log the transition.
         if (!this.state_.timerOn) {
           this.state_.timerOn = true;
           this.pushLog("Timer: ON");
@@ -927,6 +865,7 @@ export class BattleSession extends DurableObject {
       case "c":
       case "chat":
       case "c:": {
+        // Chat goes to its own transcript, not the battle log.
         this.pushChat(formatBattleLine(type, parts, mySide));
         break;
       }
@@ -983,22 +922,11 @@ export class BattleSession extends DurableObject {
     });
   }
 
-  // Bounce identity-sensitive actions to /login instead of silently running
-  // them as a guest when a saved login failed to re-apply.
-  authGuard(url) {
-    if (!this.authBroken()) return null;
-    this.state_.loginError =
-      "Your login didn't survive the reconnect - please log in again.";
-    return this.save().then(() =>
-      Response.redirect(new URL("/login", url), 302)
-    );
-  }
-
   async fetch(request) {
     try {
       await this.ensureConnected();
-      // If a reconnect kicked off a silent re-login, wait for it (it
-      // resolves only after the server confirms the rename, or fails).
+      // If a reconnect kicked off a silent re-login, wait for it so
+      // identity-sensitive commands below land under the account, not Guest.
       if (this.pendingAuth) {
         const p = this.pendingAuth;
         this.pendingAuth = null;
@@ -1007,8 +935,6 @@ export class BattleSession extends DurableObject {
       const url = new URL(request.url);
 
       if (url.pathname === "/search") {
-        const blocked = await this.authGuard(url);
-        if (blocked) return blocked;
         const format = url.searchParams.get("format") || "gen9randombattle";
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
@@ -1026,8 +952,6 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/challenge") {
         if (request.method === "POST") {
-          const blocked = await this.authGuard(url);
-          if (blocked) return blocked;
           const params = await this.readForm(request);
           const target = (params.get("username") || "").trim();
           const format = params.get("format") || "gen9randombattle";
@@ -1050,8 +974,6 @@ export class BattleSession extends DurableObject {
       }
 
       if (url.pathname === "/accept") {
-        const blocked = await this.authGuard(url);
-        if (blocked) return blocked;
         const user = url.searchParams.get("user");
         if (user) {
           this.send(`|/utm null`);
@@ -1147,11 +1069,6 @@ export class BattleSession extends DurableObject {
         this.state_.connected = false;
         await this.save();
         await this.ensureConnected();
-        if (this.pendingAuth) {
-          const p = this.pendingAuth;
-          this.pendingAuth = null;
-          try { await p; } catch {}
-        }
         return Response.redirect(new URL("/", url), 302);
       }
 
