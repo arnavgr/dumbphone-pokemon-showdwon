@@ -125,34 +125,6 @@ The home page has a "Battle a friend" section:
   line in the log) -- there's currently no way to build a team to satisfy
   that, by design.
 
-## Known limitations (read before reporting something as "broken")
-
-- **I could not test this against the live Showdown server** -- this
-  sandbox's network is locked to package registries (npm/GitHub/PyPI), not
-  `psim.us`. The protocol messages and command formats are implemented from
-  Showdown's published `PROTOCOL.md` / `SIM-PROTOCOL.md`, but expect to need
-  a debugging pass. Good first move: add a temporary `console.log` in
-  `webSocketMessage` and check `wrangler tail`.
-- **Guest only.** No login -- Showdown assigns a "Guest 1234" name
-  automatically, which is enough to ladder into random battles or send/accept
-  friend challenges. Add the `|challstr|` -> `POST /api/login` flow from
-  `PROTOCOL.md` if you want a registered/named account (the login form is
-  already wired up for this).
-- **Random battles only, no teambuilder.** Constructed tiers (OU, UU, etc.)
-  that require a custom team aren't offered, and accepting a challenge into
-  one of those formats from a friend won't work (see above).
-- **Team preview** (picking your lead in the handful of random formats that
-  use it) is wired up via `/lead` -- you can tap a specific Pokemon or use
-  "Auto lead first".
-- **Singles-oriented.** Doubles formats aren't offered on the home page
-  because the choice UI doesn't handle multi-target move selection; stick to
-  the singles random formats listed above.
-- **One battle at a time per session**, no chat, no tournament support.
-  These are addable later using the same `sendToRoom` plumbing.
-- **Opponent's active Pokemon** is tracked by watching `switch`/`damage`
-  log lines, not full request data (Showdown only sends you your own
-  team's detail) -- so it shows species + HP condition, not full stats.
-
 ## File map
 
 - `src/index.js` -- Worker entry, session cookie, routes to the Durable Object.
