@@ -846,19 +846,14 @@ export class BattleSession extends DurableObject {
       }
 
       case "inactive": {
-        // Timer upkeep lines fire every turn; only log the transition.
-        if (!this.state_.timerOn) {
-          this.state_.timerOn = true;
-          this.pushLog("Timer: ON");
-        }
+        this.state_.timerOn = true;
+        this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "inactiveoff": {
-        if (this.state_.timerOn) {
-          this.state_.timerOn = false;
-          this.pushLog("Timer: OFF");
-        }
+        this.state_.timerOn = false;
+        this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
@@ -1051,7 +1046,9 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
-          try { this.sendToRoom(this.state_.roomId, "/timer"); } catch {}
+          // Send explicit absolute commands instead of a bare toggle
+          const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
+          try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
         return Response.redirect(new URL("/battle", url), 302);
       }

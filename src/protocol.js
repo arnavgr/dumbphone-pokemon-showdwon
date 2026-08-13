@@ -152,11 +152,8 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "c:":
       return `${stripRank(parts[1])}: ${parts.slice(2).join("|")}`;
     case "inactive":
-      return "Timer: ON";
     case "inactiveoff":
-      return "Timer: OFF";
-    case "tier":
-      return `Format: ${parts[0]}`;
+      return parts[0] || null; 
     case "teampreview":
       return "Team preview.";
     case "start":

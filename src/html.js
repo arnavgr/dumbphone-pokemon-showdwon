@@ -236,15 +236,41 @@ function renderTypeMatchup(state) {
     .filter((p) => p.condition !== "0 fnt")
     .map((p) => {
       const species = (p.details || "").split(",")[0];
+      
+      // 1. Calculate Offensive Matchup (Best Move)
       const moveTypes = p.moveTypes || [];
       const best = moveTypes.length
         ? Math.max(...moveTypes.map((t) => typeEffectiveness(t, oppTypes)))
         : null;
+
+      // 2. Calculate Defensive Matchup (Strengths & Weaknesses vs Opponent's Types)
+      const myTypes = p.types || [];
+      const weakTo = [];
+      const strongAgainst = [];
+      const immuneTo = [];
+
+      if (myTypes.length) {
+        for (const oppType of oppTypes) {
+          const defEff = typeEffectiveness(oppType, myTypes);
+          if (defEff > 1) weakTo.push(oppType.toLowerCase());
+          else if (defEff === 0) immuneTo.push(oppType.toLowerCase());
+          else if (defEff < 1) strongAgainst.push(oppType.toLowerCase());
+        }
+      }
+
+      const defParts = [];
+      if (immuneTo.length) defParts.push(`immune to ${immuneTo.join("/")}`);
+      if (weakTo.length) defParts.push(`weak against ${weakTo.join("/")}`);
+      if (strongAgainst.length) defParts.push(`strong against ${strongAgainst.join("/")}`);
+
+      const defLabel = defParts.length ? `, ${defParts.join(", ")}` : "";
+
       return {
         species,
         active: !!p.active,
         best,
         hasMoves: Array.isArray(p.moves) && p.moves.length > 0,
+        defLabel // Inject defensive data
       };
     })
     .sort((a, b) => (b.best ?? -1) - (a.best ?? -1));
@@ -255,11 +281,21 @@ function renderTypeMatchup(state) {
 
   let body = `<h2>Type matchup vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]</h2>`;
   for (const r of rows) {
-    const label =
-      r.best === null
-        ? r.hasMoves ? "no attacking moves known" : "moves unknown"
-        : describeMultiplier(r.best);
-    body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: ${esc(label)}</div>`;
+    let label = "";
+    if (r.best === null) {
+      label = r.hasMoves ? "no attacking moves known" : "moves unknown";
+    } else if (r.best === 1) {
+      label = "1x neutral move";
+    } else if (r.best >= 2) {
+      label = `${r.best}x super effective move`;
+    } else if (r.best === 0) {
+      label = "0x no effect move";
+    } else {
+      label = `${r.best}x resisted move`;
+    }
+    
+    // Append the defensive data to the output
+    body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: ${esc(label)}${esc(r.defLabel)}</div>`;
   }
   return body;
 }
