@@ -1055,7 +1055,7 @@ export class BattleSession extends DurableObject {
           const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
           try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
-        return this.redirect(new URL("/battle", url));
+        return Response.redirect(new URL("/battle", url), 302);
       }
 
       if (url.pathname === "/forfeit") {
