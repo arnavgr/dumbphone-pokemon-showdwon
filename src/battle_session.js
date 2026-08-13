@@ -846,19 +846,14 @@ export class BattleSession extends DurableObject {
       }
 
       case "inactive": {
-        // Timer upkeep lines fire every turn; only log the transition.
-        if (!this.state_.timerOn) {
-          this.state_.timerOn = true;
-          this.pushLog("Timer: ON");
-        }
+        this.state_.timerOn = true;
+        this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
       case "inactiveoff": {
-        if (this.state_.timerOn) {
-          this.state_.timerOn = false;
-          this.pushLog("Timer: OFF");
-        }
+        this.state_.timerOn = false;
+        this.pushLog(formatBattleLine(type, parts, mySide));
         break;
       }
 
