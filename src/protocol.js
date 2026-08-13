@@ -190,6 +190,14 @@ export function formatBattleLine(type, parts, mySide = null) {
       const p = parseIdent(parts[0]);
       return `${p.name} recovered from its status.`;
     }
+    case "-start": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}: ${parts[1]} started.`;
+    }
+    case "-end": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}'s ${parts[1]} ended.`;
+    }
     case "-boost": {
       const p = parseIdent(parts[0]);
       return `${p.name}'s ${parts[1]} rose! (+${parts[2]})`;
