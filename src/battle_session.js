@@ -1051,9 +1051,11 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
-          try { this.sendToRoom(this.state_.roomId, "/timer"); } catch {}
+          // Send explicit absolute commands instead of a bare toggle
+          const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
+          try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return this.redirect(new URL("/battle", url));
       }
 
       if (url.pathname === "/forfeit") {
