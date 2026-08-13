@@ -342,7 +342,7 @@ export class BattleSession extends DurableObject {
   }
 
   async ensureConnected() {
-    if (this.ws && this.ws.readyState === 1 /* OPEN */) {
+    if (this.ws && this.ws.readyState === 1) {
       return;
     }
     if (!this.state_.upstreamCookie) {
@@ -414,8 +414,7 @@ export class BattleSession extends DurableObject {
   }
 
   async onSocketMessage(message) {
-    const text =
-      typeof message === "string" ? message : new TextDecoder().decode(message);
+    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
     const { roomId, lines } = splitFrame(text);
     for (const rawLine of lines) {
       await this.handleLine(roomId, rawLine);
@@ -931,9 +930,32 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/search") {
         const format = url.searchParams.get("format") || "gen9randombattle";
+        try { this.send(`|/cancelsearch`); } catch {}
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
-        this.state_.notice = `Searching for ${format}...`;
+        
+        const hadBattle = !!(this.state_.roomId && !this.state_.ended);
+        const deadline = Date.now() + 5000;
+        let ok = false;
+        let instantMatch = false;
+
+        while (Date.now() < deadline) {
+          if ((this.state_.searching || []).includes(format)) { ok = true; break; }
+          if (!hadBattle && this.state_.roomId && !this.state_.ended) { 
+             ok = true; 
+             instantMatch = true; 
+             break; 
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        
+        if (instantMatch) {
+          this.state_.notice = null;
+          await this.save();
+          return Response.redirect(new URL("/battle", url), 302);
+        }
+        
+        this.state_.notice = ok ? `Searching for ${format}...` : `Search failed to initialize.`;
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
@@ -1054,7 +1076,8 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
-          try { this.sendToRoom(this.state_.roomId, "/timer"); } catch {}
+          const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
+          try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
         return Response.redirect(new URL("/battle", url), 302);
       }
