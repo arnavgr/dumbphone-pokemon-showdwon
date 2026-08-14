@@ -446,7 +446,7 @@ export class BattleSession extends DurableObject {
     });
 
     if (this.state_.roomId && !this.state_.ended) {
-      ws.send(`|/join ${this.state_.roomId}`);
+      try { ws.send(`${this.state_.roomId}|/join ${this.state_.roomId}`); } catch {}
     }
 
     if (this.state_.loginName && this.state_.loginPassword) {
@@ -515,7 +515,7 @@ export class BattleSession extends DurableObject {
       case "updateuser": {
         const rawName = parts[0] || "";
         const name = rawName.trim().replace(/^[^A-Za-z0-9]+/, "");
-        const named = parts.length > 1 ? parts[1] === "1" : (!/^guest/i.test(name) && name.length > 0);
+        const named = parts[1] === "1" || parts[1] === 1 || (!/^guest/i.test(name) && name.length > 0 && parts[1] !== "0");
         this.state_.username = name;
         this.state_.loggedIn = named;
 
@@ -567,11 +567,16 @@ export class BattleSession extends DurableObject {
           this.state_.searching = json.searching || [];
           if (json.games) {
             const ids = Object.keys(json.games);
-            if (ids.length && ids[0] !== this.state_.roomId) {
-              this.resetBattle();
-              this.state_.roomId = ids[0];
-              this.state_.roomTitle = json.games[ids[0]];
-              this.sendToRoom(ids[0], "/join " + ids[0]);
+            if (ids.length > 0) {
+              const gid = ids[0];
+              if (gid !== this.state_.roomId) {
+                this.resetBattle();
+                this.state_.roomId = gid;
+                this.state_.roomTitle = json.games[gid] || gid;
+                this.sendToRoom(gid, "/join " + gid);
+              }
+            } else if (this.state_.roomId && !this.state_.ended) {
+              this.state_.ended = true;
             }
           }
         } catch {}
@@ -847,7 +852,7 @@ export class BattleSession extends DurableObject {
             }
             if (entry.baseStats && Number.isFinite(entry.baseStats.spe) && mon.level) {
               mon.predictedSpeed =
-                Math.floor(((2 * entry.baseStats.spe + 85) * mon.level) / 100) + 5;
+                Math.floor(((2 * entry.baseStats.spe + 85) * level) / 100) + 5;
             }
             mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
             mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
@@ -1011,6 +1016,10 @@ export class BattleSession extends DurableObject {
       const url = new URL(request.url);
 
       if (url.pathname === "/search") {
+        if (this.state_.ended || !this.state_.roomId) {
+          this.resetBattle();
+        }
+
         if (this.state_.loginName) {
           try {
             await this.autoRelogin();
@@ -1021,14 +1030,12 @@ export class BattleSession extends DurableObject {
           }
         }
 
-        if (!this.state_.loggedIn && this.state_.loginName) {
-          this.state_.notice = `Search blocked: Saved account (${this.state_.loginName}) is not authenticated on this connection.`;
-          await this.save();
-          return Response.redirect(new URL("/debug", url), 302);
-        }
-
         const format = url.searchParams.get("format") || "gen9randombattle";
-        try { this.send(`|/cancelsearch`); } catch {}
+        
+        if (this.state_.searching.length > 0) {
+          try { this.send(`|/cancelsearch`); } catch {}
+        }
+        
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
         
@@ -1053,7 +1060,11 @@ export class BattleSession extends DurableObject {
           return Response.redirect(new URL("/battle", url), 302);
         }
         
-        this.state_.notice = ok ? `Searching for ${format}...` : `Search queued.`;
+        if (ok) {
+          this.state_.notice = `Searching for ${format}...`;
+        } else {
+          this.state_.notice = `Search did not start on Showdown server. Check /debug.`;
+        }
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
@@ -1231,12 +1242,16 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/logout") {
         try { this.send("|/logout"); } catch {}
+        try { this.ws?.close(); } catch {}
+        this.ws = null;
         this.state_.loggedIn = false;
         this.state_.username = null;
         this.state_.loginName = null;
         this.state_.loginPassword = null;
         this.state_.mySide = null;
+        this.state_.connected = false;
         this.relogDisabled = false;
+        this.state_.notice = "Logged out.";
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
