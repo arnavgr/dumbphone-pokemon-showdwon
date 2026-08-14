@@ -292,13 +292,17 @@ export class BattleSession extends DurableObject {
     const start = Date.now();
     while (!this.freshChallstr || !this.state_.challstr) {
       if (Date.now() - start > timeoutMs) {
-        throw new Error("Timed out waiting for fresh challenge string from Showdown.");
+        throw new Error("Timed out waiting for challenge string from Showdown.");
       }
       await new Promise((r) => setTimeout(r, 100));
     }
   }
 
   async login(username, password) {
+    this.state_.loginName = username;
+    this.state_.loginPassword = password;
+    this.state_.loginError = null;
+
     await this.waitForFreshChallstr(8000);
 
     const body = new URLSearchParams();
@@ -329,7 +333,10 @@ export class BattleSession extends DurableObject {
       action?.assertion || data?.assertion || action?.data?.assertion || null;
 
     if (!assertion) {
-      throw new Error(action?.actionerror || data?.actionerror || "Login assertion rejected.");
+      const errReason = action?.actionerror || data?.actionerror || "Login assertion rejected.";
+      this.state_.loginPassword = null;
+      this.relogDisabled = true;
+      throw new Error(errReason);
     }
 
     const finalName = action?.username || username;
@@ -353,10 +360,9 @@ export class BattleSession extends DurableObject {
 
     this.state_.username = finalName;
     this.state_.loggedIn = true;
-    this.state_.loginName = username;
+    this.state_.loginName = finalName;
     this.state_.loginPassword = password;
     this.state_.loginError = null;
-    this.state_.serverMsg = null;
     this.relogDisabled = false;
     this.state_.notice = `Logged in as ${finalName}.`;
   }
@@ -366,6 +372,10 @@ export class BattleSession extends DurableObject {
     const { loginName, loginPassword } = this.state_;
     if (!loginName || !loginPassword) return;
 
+    if (this.state_.loggedIn && this.ws && this.ws.readyState === 1 && this.state_.username?.toLowerCase() === loginName.toLowerCase()) {
+      return;
+    }
+
     if (!this.relogPromise) {
       this.relogPromise = (async () => {
         try {
@@ -374,7 +384,6 @@ export class BattleSession extends DurableObject {
           this.pushLog(`(authenticated as ${loginName})`);
           this.state_.notice = oldNotice;
         } catch (err) {
-          this.relogDisabled = true;
           this.pushLog(`(auto-login failed: ${err.message || err})`);
           throw err;
         } finally {
@@ -422,6 +431,7 @@ export class BattleSession extends DurableObject {
     this.freshChallstr = false;
     this.state_.challstr = null;
     this.state_.connected = true;
+    this.state_.loggedIn = false;
 
     ws.addEventListener("message", (event) => {
       this.ctx.waitUntil(this.onSocketMessage(event.data));
@@ -437,6 +447,10 @@ export class BattleSession extends DurableObject {
 
     if (this.state_.roomId && !this.state_.ended) {
       ws.send(`|/join ${this.state_.roomId}`);
+    }
+
+    if (this.state_.loginName && this.state_.loginPassword) {
+      this.pendingAuth = this.autoRelogin();
     }
 
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
@@ -471,6 +485,7 @@ export class BattleSession extends DurableObject {
     this.ws = null;
     this.freshChallstr = false;
     this.state_.connected = false;
+    this.state_.loggedIn = false;
     this.pushLog(`(disconnected: ${event.reason || event.code})`);
     await this.save();
   }
@@ -479,6 +494,7 @@ export class BattleSession extends DurableObject {
     this.ws = null;
     this.freshChallstr = false;
     this.state_.connected = false;
+    this.state_.loggedIn = false;
     this.pushLog(`(socket error)`);
     await this.save();
   }
@@ -503,12 +519,25 @@ export class BattleSession extends DurableObject {
         this.state_.username = name;
         this.state_.loggedIn = named;
 
+        if (this.loginConfirmResolve && named) {
+          const res = this.loginConfirmResolve;
+          this.loginConfirmResolve = null;
+          res(true);
+        }
+        this.detectMySide();
+        break;
+      }
+
+      case "nametaken": {
+        const takenUser = parts[0] || "";
+        const reason = parts[1] || "Name taken or login rejected";
+        this.state_.serverMsg = reason;
+        this.pushLog(`[server] Name rejected for ${takenUser}: ${reason}`);
         if (this.loginConfirmResolve) {
           const res = this.loginConfirmResolve;
           this.loginConfirmResolve = null;
-          res(named);
+          res(false);
         }
-        this.detectMySide();
         break;
       }
 
@@ -520,11 +549,6 @@ export class BattleSession extends DurableObject {
         if (msg) {
           this.state_.serverMsg = msg;
           this.pushLog(`[server] ${msg}`);
-        }
-        if (this.loginConfirmResolve) {
-          const res = this.loginConfirmResolve;
-          this.loginConfirmResolve = null;
-          res(false);
         }
         break;
       }
@@ -988,15 +1012,19 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/search") {
         if (this.state_.loginName) {
-          if (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1) {
-            try {
-              await this.autoRelogin();
-            } catch (err) {
-              this.state_.notice = `Search blocked: Authentication failed (${err.message}).`;
-              await this.save();
-              return Response.redirect(new URL("/", url), 302);
-            }
+          try {
+            await this.autoRelogin();
+          } catch (err) {
+            this.state_.notice = `Search blocked: Authentication failed (${err.message}).`;
+            await this.save();
+            return Response.redirect(new URL("/debug", url), 302);
           }
+        }
+
+        if (!this.state_.loggedIn && this.state_.loginName) {
+          this.state_.notice = `Search blocked: Saved account (${this.state_.loginName}) is not authenticated on this connection.`;
+          await this.save();
+          return Response.redirect(new URL("/debug", url), 302);
         }
 
         const format = url.searchParams.get("format") || "gen9randombattle";
@@ -1043,7 +1071,7 @@ export class BattleSession extends DurableObject {
           const target = (params.get("username") || "").trim();
           const format = params.get("format") || "gen9randombattle";
           if (target) {
-            if (this.state_.loginName && (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1)) {
+            if (this.state_.loginName) {
               await this.autoRelogin();
             }
             this.send(`|/utm null`);
@@ -1066,7 +1094,7 @@ export class BattleSession extends DurableObject {
       if (url.pathname === "/accept") {
         const user = url.searchParams.get("user");
         if (user) {
-          if (this.state_.loginName && (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1)) {
+          if (this.state_.loginName) {
             await this.autoRelogin();
           }
           this.send(`|/utm null`);
@@ -1179,6 +1207,7 @@ export class BattleSession extends DurableObject {
         this.ws = null;
         this.freshChallstr = false;
         this.state_.connected = false;
+        this.state_.loggedIn = false;
         await this.save();
         await this.ensureConnected();
         return Response.redirect(new URL("/debug", url), 302);
@@ -1220,9 +1249,8 @@ export class BattleSession extends DurableObject {
       }
 
       const homeHtml = renderHome(this.state_);
-      if (this.state_.notice || this.state_.loginError) {
+      if (this.state_.notice) {
         this.state_.notice = null;
-        this.state_.loginError = null;
         await this.save();
       }
       return this.htmlResponse(homeHtml);

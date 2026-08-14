@@ -384,7 +384,7 @@ export function renderHome(state) {
   }${state.loggedIn ? " (logged in)" : ""}</div>`;
 
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
-  if (state.loginError) body += `<p>Login error: ${esc(state.loginError)}</p>`;
+  if (state.loginError) body += `<p style="color:#b22">Login error: ${esc(state.loginError)}</p>`;
   if (state.serverMsg) body += `<p><b>Server:</b> ${esc(state.serverMsg)}</p>`;
 
   body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
@@ -424,10 +424,10 @@ export function renderHome(state) {
 export function renderLogin(state) {
   let body = `<h1>Login</h1>`;
 
-  if (state.loginError) body += `<p>${esc(state.loginError)}</p>`;
+  if (state.loginError) body += `<p style="color:#b22">${esc(state.loginError)}</p>`;
 
   body += `<form method="post" action="/login">
-<div><label>Username<br><input type="text" name="username"></label></div>
+<div><label>Username<br><input type="text" name="username" value="${esc(state.loginName || "")}"></label></div>
 <div><label>Password<br><input type="password" name="password"></label></div>
 <p class="muted">Warning: this worker stores your password so it can silently re-login after reconnects. Use only on your own personal deployment.</p>
 <div><input type="submit" value="Login"></div>
