@@ -16,6 +16,7 @@ import {
   renderLogin,
   renderMoveInfo,
   renderDex,
+  renderDebug,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
@@ -55,6 +56,13 @@ function sideKey(side) {
   return String(side || "").slice(0, 2);
 }
 
+function cleanMsg(s) {
+  return String(s || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 const DEFAULT_STATE = {
   connected: false,
   username: null,
@@ -75,6 +83,7 @@ const DEFAULT_STATE = {
   challstr: null,
   notice: null,
   loginError: null,
+  serverMsg: null,
   upstreamCookie: null,
   challengesFrom: {},
   challengeTo: null,
@@ -95,6 +104,8 @@ export class BattleSession extends DurableObject {
     this.pendingAuth = null;
     this.relogPromise = null;
     this.relogDisabled = false;
+    this.freshChallstr = false;
+    this.loginConfirmResolve = null;
 
     this.ctx.blockConcurrencyWhile(async () => {
       const saved = await this.ctx.storage.get("state");
@@ -277,13 +288,19 @@ export class BattleSession extends DurableObject {
     return new URLSearchParams(text);
   }
 
+  async waitForFreshChallstr(timeoutMs = 8000) {
+    const start = Date.now();
+    while (!this.freshChallstr || !this.state_.challstr) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error("Timed out waiting for fresh challenge string from Showdown.");
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
   async login(username, password) {
-    if (!this.state_.challstr) {
-      await new Promise((resolve) => setTimeout(resolve, 800));
-    }
-    if (!this.state_.challstr) {
-      throw new Error("No challstr received yet. Refresh and try again.");
-    }
+    await this.waitForFreshChallstr(8000);
+
     const body = new URLSearchParams();
     body.set("act", "login");
     body.set("name", username);
@@ -295,44 +312,71 @@ export class BattleSession extends DurableObject {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     });
+
     const text = await res.text();
     let jsonText = text.trim();
     if (jsonText.startsWith("]")) jsonText = jsonText.slice(1);
+
     let data;
     try {
       data = JSON.parse(jsonText);
     } catch {
       throw new Error(`Unexpected login response: ${text.slice(0, 120)}`);
     }
+
     const action = Array.isArray(data?.actions) ? data.actions[0] : data;
     const assertion =
       action?.assertion || data?.assertion || action?.data?.assertion || null;
+
     if (!assertion) {
-      throw new Error(action?.actionerror || data?.actionerror || "Login failed.");
+      throw new Error(action?.actionerror || data?.actionerror || "Login assertion rejected.");
     }
+
     const finalName = action?.username || username;
+
+    let confirmResolve;
+    const confirmPromise = new Promise((resolve) => {
+      confirmResolve = resolve;
+      setTimeout(() => resolve(false), 8000);
+    });
+    this.loginConfirmResolve = confirmResolve;
+
     this.send(`|/trn ${finalName},0,${assertion}`);
+
+    const confirmed = await confirmPromise;
+    this.loginConfirmResolve = null;
+
+    if (!confirmed) {
+      this.state_.loggedIn = false;
+      throw new Error("Showdown did not confirm authenticated state (remained as guest).");
+    }
+
     this.state_.username = finalName;
     this.state_.loggedIn = true;
-    this.state_.loginError = null;
     this.state_.loginName = username;
     this.state_.loginPassword = password;
+    this.state_.loginError = null;
+    this.state_.serverMsg = null;
     this.relogDisabled = false;
-    this.state_.notice = "Logged in.";
+    this.state_.notice = `Logged in as ${finalName}.`;
   }
 
   async autoRelogin() {
     if (this.relogDisabled) return;
     const { loginName, loginPassword } = this.state_;
     if (!loginName || !loginPassword) return;
+
     if (!this.relogPromise) {
       this.relogPromise = (async () => {
         try {
+          const oldNotice = this.state_.notice;
           await this.login(loginName, loginPassword);
-          this.pushLog(`(logged back in as ${loginName})`);
+          this.pushLog(`(authenticated as ${loginName})`);
+          this.state_.notice = oldNotice;
         } catch (err) {
           this.relogDisabled = true;
           this.pushLog(`(auto-login failed: ${err.message || err})`);
+          throw err;
         } finally {
           this.relogPromise = null;
         }
@@ -345,6 +389,7 @@ export class BattleSession extends DurableObject {
     if (this.ws && this.ws.readyState === 1) {
       return;
     }
+
     if (!this.state_.upstreamCookie) {
       try {
         const infoRes = await fetch("https://sim3.psim.us/showdown/info");
@@ -363,7 +408,7 @@ export class BattleSession extends DurableObject {
     const resp = await fetch(SHOWDOWN_WS_URL, { headers });
     const ws = resp.webSocket;
     if (!ws) {
-      throw new Error("Showdown server did not accept the WebSocket upgrade");
+      throw new Error("Showdown server did not accept WebSocket upgrade");
     }
     const setCookie = resp.headers.get("Set-Cookie");
     if (setCookie) {
@@ -372,20 +417,11 @@ export class BattleSession extends DurableObject {
     }
 
     ws.accept();
-    if (this.state_.roomId && !this.state_.ended) {
-      ws.send(`|/join ${this.state_.roomId}`);
-    }
+    this.ws = ws;
 
-    if (this.state_.loginName && this.state_.loginPassword) {
-      this.pendingAuth = this.autoRelogin();
-    }
-
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    this.keepAliveInterval = setInterval(() => {
-      try {
-        if (this.ws && this.ws.readyState === 1) this.ws.send("");
-      } catch {}
-    }, 45000);
+    this.freshChallstr = false;
+    this.state_.challstr = null;
+    this.state_.connected = true;
 
     ws.addEventListener("message", (event) => {
       this.ctx.waitUntil(this.onSocketMessage(event.data));
@@ -399,8 +435,17 @@ export class BattleSession extends DurableObject {
       this.ctx.waitUntil(this.onSocketError());
     });
 
-    this.ws = ws;
-    this.state_.connected = true;
+    if (this.state_.roomId && !this.state_.ended) {
+      ws.send(`|/join ${this.state_.roomId}`);
+    }
+
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    this.keepAliveInterval = setInterval(() => {
+      try {
+        if (this.ws && this.ws.readyState === 1) this.ws.send("");
+      } catch {}
+    }, 45000);
+
     await this.save();
   }
 
@@ -424,15 +469,17 @@ export class BattleSession extends DurableObject {
 
   async onSocketClose(event) {
     this.ws = null;
+    this.freshChallstr = false;
     this.state_.connected = false;
-    this.pushLog(`(disconnected from server: ${event.reason || event.code})`);
+    this.pushLog(`(disconnected: ${event.reason || event.code})`);
     await this.save();
   }
 
   async onSocketError() {
     this.ws = null;
+    this.freshChallstr = false;
     this.state_.connected = false;
-    this.pushLog(`(connection error)`);
+    this.pushLog(`(socket error)`);
     await this.save();
   }
 
@@ -444,25 +491,41 @@ export class BattleSession extends DurableObject {
     switch (type) {
       case "challstr": {
         this.state_.challstr = parts.join("|");
+        this.freshChallstr = true;
         this.state_.connected = true;
-        if (this.state_.roomId && !this.state_.ended) {
-          try {
-            this.sendToRoom(this.state_.roomId, `/join ${this.state_.roomId}`);
-          } catch {}
-        }
         break;
       }
 
       case "updateuser": {
         const rawName = parts[0] || "";
         const name = rawName.trim().replace(/^[^A-Za-z0-9]+/, "");
-        const isGuest = /^guest/i.test(name);
+        const named = parts.length > 1 ? parts[1] === "1" : (!/^guest/i.test(name) && name.length > 0);
         this.state_.username = name;
-        this.state_.loggedIn = !isGuest;
-        if (isGuest && this.state_.loginName && this.state_.loginPassword) {
-          await this.autoRelogin();
+        this.state_.loggedIn = named;
+
+        if (this.loginConfirmResolve) {
+          const res = this.loginConfirmResolve;
+          this.loginConfirmResolve = null;
+          res(named);
         }
         this.detectMySide();
+        break;
+      }
+
+      case "popup":
+      case "message":
+      case "error":
+      case "warning": {
+        const msg = cleanMsg(parts.join("|"));
+        if (msg) {
+          this.state_.serverMsg = msg;
+          this.pushLog(`[server] ${msg}`);
+        }
+        if (this.loginConfirmResolve) {
+          const res = this.loginConfirmResolve;
+          this.loginConfirmResolve = null;
+          res(false);
+        }
         break;
       }
 
@@ -921,14 +984,21 @@ export class BattleSession extends DurableObject {
   async fetch(request) {
     try {
       await this.ensureConnected();
-      if (this.pendingAuth) {
-        const p = this.pendingAuth;
-        this.pendingAuth = null;
-        try { await p; } catch {}
-      }
       const url = new URL(request.url);
 
       if (url.pathname === "/search") {
+        if (this.state_.loginName) {
+          if (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1) {
+            try {
+              await this.autoRelogin();
+            } catch (err) {
+              this.state_.notice = `Search blocked: Authentication failed (${err.message}).`;
+              await this.save();
+              return Response.redirect(new URL("/", url), 302);
+            }
+          }
+        }
+
         const format = url.searchParams.get("format") || "gen9randombattle";
         try { this.send(`|/cancelsearch`); } catch {}
         this.send(`|/utm null`);
@@ -955,7 +1025,7 @@ export class BattleSession extends DurableObject {
           return Response.redirect(new URL("/battle", url), 302);
         }
         
-        this.state_.notice = ok ? `Searching for ${format}...` : `Search failed to initialize.`;
+        this.state_.notice = ok ? `Searching for ${format}...` : `Search queued.`;
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
@@ -973,6 +1043,9 @@ export class BattleSession extends DurableObject {
           const target = (params.get("username") || "").trim();
           const format = params.get("format") || "gen9randombattle";
           if (target) {
+            if (this.state_.loginName && (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1)) {
+              await this.autoRelogin();
+            }
             this.send(`|/utm null`);
             this.send(`|/challenge ${target}, ${format}`);
             this.state_.notice = `Challenge sent to ${target}.`;
@@ -993,6 +1066,9 @@ export class BattleSession extends DurableObject {
       if (url.pathname === "/accept") {
         const user = url.searchParams.get("user");
         if (user) {
+          if (this.state_.loginName && (!this.state_.loggedIn || !this.ws || this.ws.readyState !== 1)) {
+            await this.autoRelogin();
+          }
           this.send(`|/utm null`);
           this.send(`|/accept ${user}`);
         }
@@ -1074,6 +1150,15 @@ export class BattleSession extends DurableObject {
         return this.htmlResponse(renderDex(entry, q));
       }
 
+      if (url.pathname === "/debug") {
+        const extra = {
+          wsOpen: Boolean(this.ws && this.ws.readyState === 1),
+          wsState: this.ws ? this.ws.readyState : "NULL",
+          freshChallstr: this.freshChallstr,
+        };
+        return this.htmlResponse(renderDebug(this.state_, extra));
+      }
+
       if (url.pathname === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
           const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
@@ -1092,10 +1177,11 @@ export class BattleSession extends DurableObject {
       if (url.pathname === "/reconnect") {
         try { this.ws?.close(); } catch {}
         this.ws = null;
+        this.freshChallstr = false;
         this.state_.connected = false;
         await this.save();
         await this.ensureConnected();
-        return Response.redirect(new URL("/", url), 302);
+        return Response.redirect(new URL("/debug", url), 302);
       }
 
       if (url.pathname === "/login") {

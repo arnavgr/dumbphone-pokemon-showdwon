@@ -385,8 +385,9 @@ export function renderHome(state) {
 
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p>Login error: ${esc(state.loginError)}</p>`;
+  if (state.serverMsg) body += `<p><b>Server:</b> ${esc(state.serverMsg)}</p>`;
 
-  body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
+  body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -539,7 +540,7 @@ export function renderBattle(state) {
 
   body += `<p><a href="/battle">Refresh</a> | <a href="/timer">${
     state.timerOn ? "Turn timer off" : "Turn timer on"
-  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
+  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -571,7 +572,7 @@ export function renderMoveInfo(move, moveId, state) {
   if (oppTypes && oppTypes.length) {
     const oppLabel = oppInfo.species || oppInfo.nickname || "the opponent";
     if (move.category === "Status") {
-      body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: status move - type effectiveness doesn't apply.</p>`;
+      body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}] status move - type effectiveness doesn't apply.</p>`;
     } else {
       const mult = typeEffectiveness(move.type, oppTypes);
       body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: <strong>${esc(
@@ -618,11 +619,40 @@ export function renderDex(entry, q) {
   return page(entry ? `Pok&eacute;dex: ${entry.name}` : "Pok&eacute;dex", body);
 }
 
+export function renderDebug(state, extra) {
+  let body = `<h1>System Debug</h1>`;
+  body += `<p><a href="/">Home</a> | <a href="/reconnect">Force Reconnect</a> | <a href="/debug">Refresh Debug</a></p>`;
+  body += `<h2>State Overview</h2>`;
+  body += `<pre style="background:#222;padding:6px;border-radius:4px;font-size:12px;overflow-x:auto;">`;
+  body += `WebSocket Open: ${extra.wsOpen}\n`;
+  body += `WS readyState: ${extra.wsState}\n`;
+  body += `Connected: ${state.connected}\n`;
+  body += `Username: ${state.username || "none"}\n`;
+  body += `Logged In (named=1): ${state.loggedIn}\n`;
+  body += `Saved Account: ${state.loginName || "none"}\n`;
+  body += `Fresh Challstr: ${extra.freshChallstr}\n`;
+  body += `Room ID: ${state.roomId || "none"}\n`;
+  body += `Searching: ${JSON.stringify(state.searching || [])}\n`;
+  body += `Timer: ${state.timerOn ? "ON" : "OFF"}\n`;
+  body += `Notice: ${state.notice || "none"}\n`;
+  body += `Login Error: ${state.loginError || "none"}\n`;
+  body += `Server Msg: ${state.serverMsg || "none"}\n`;
+  body += `Upstream Cookie: ${state.upstreamCookie ? "present" : "none"}\n`;
+  body += `</pre>`;
+
+  body += `<h2>System & Combat Logs (Last 50)</h2>`;
+  const recentLogs = (state.log || []).slice(-50);
+  body += `<div class="log">${recentLogs.map((l) => `<div>${esc(l)}</div>`).join("") || '<div class="muted">(no logs)</div>'}</div>`;
+
+  body += `<p><a href="/">Back to Home</a></p>`;
+  return page("System Debug", body);
+}
+
 export function renderError(message) {
   return page(
     "Error",
     `<h1>Error</h1>
 <p>${esc(message)}</p>
-<p><a href="/">Home</a></p>`
+<p><a href="/debug">View Debug Logs</a> | <a href="/">Home</a></p>`
   );
 }
