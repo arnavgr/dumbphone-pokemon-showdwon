@@ -7,9 +7,6 @@ function getCookie(request, name) {
   return match ? match[1] : null;
 }
 
-// ---------------------------------------------------------------------------
-// Same-origin sprite proxy (/sprite/*)
-// ---------------------------------------------------------------------------
 const FOLDER_EXT = {
   gen5: ".png",
   "gen5-back": ".png",
@@ -65,7 +62,6 @@ async function handleSprite(request, url) {
     const cached = await caches.default.match(cacheKey);
     if (cached) return cached;
   } catch {
-    // Cache unavailable
   }
 
   const sources = [
@@ -101,7 +97,6 @@ async function handleSprite(request, url) {
       try {
         await caches.default.put(cacheKey, response.clone());
       } catch {
-        // Ignore cache put failures
       }
 
       return response;
@@ -111,9 +106,6 @@ async function handleSprite(request, url) {
   return new Response("Sprite not found", { status: 404 });
 }
 
-// ---------------------------------------------------------------------------
-// Main Worker entry
-// ---------------------------------------------------------------------------
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);

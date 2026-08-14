@@ -22,9 +22,6 @@ function page(title, body, refresh = 0) {
   const refreshTag =
     refresh > 0 ? `<meta http-equiv="refresh" content="${refresh}">` : "";
 
-  // Tiny, float-free CSS: every clickable card is ONE <a> with its sprite
-  // inside the anchor so D-pad engines can't strand focus on the image.
-  // All glyphs are plain ASCII for ancient font stacks.
   return `<!doctype html>
 <html>
 <head>
@@ -84,6 +81,12 @@ function boostsLine(boosts) {
   return ` <span class="chip">${esc(parts.join(", "))}</span>`;
 }
 
+function volatilesLine(vols) {
+  if (!vols || !vols.length) return "";
+  const cleaned = vols.map(v => esc(v.replace(/^(move|ability|item):\s*/i, '')));
+  return ` <span class="chip" style="border-color:#b88;color:#ecc">${cleaned.join(", ")}</span>`;
+}
+
 function activeForSide(state, which) {
   const mySide = state.mySide || "p1";
   const side = which === "my" ? mySide : mySide === "p1" ? "p2" : "p1";
@@ -121,8 +124,6 @@ function renderActive(state, which) {
   const mons = activeForSide(state, which);
   if (!mons.length) return `<div class="muted">?</div>`;
 
-  // Your own active mon's exact stats/ability/item come from the request;
-  // the opponent's never do, so they get predicted Spe + revealed details.
   const myActiveFull =
     which === "my"
       ? (state.request?.side?.pokemon || []).find((p) => p.active)
@@ -170,7 +171,7 @@ function renderActive(state, which) {
       }
 
       return `<div>${img}<div><strong>${esc(label)}</strong>${esc(nick)}${lvl}${types}</div>
-<div>${hpBar(info.condition)}${boostsLine(info.boosts)}</div>${intel}</div>`;
+<div>${hpBar(info.condition)}${boostsLine(info.boosts)}${volatilesLine(info.volatiles)}</div>${intel}</div>`;
     })
     .join("<hr>");
 }
@@ -237,13 +238,11 @@ function renderTypeMatchup(state) {
     .map((p) => {
       const species = (p.details || "").split(",")[0];
       
-      // 1. Calculate Offensive Matchup (Best Move)
       const moveTypes = p.moveTypes || [];
       const best = moveTypes.length
         ? Math.max(...moveTypes.map((t) => typeEffectiveness(t, oppTypes)))
         : null;
 
-      // 2. Calculate Defensive Matchup (Strengths & Weaknesses vs Opponent's Types)
       const myTypes = p.types || [];
       const weakTo = [];
       const strongAgainst = [];
@@ -270,7 +269,7 @@ function renderTypeMatchup(state) {
         active: !!p.active,
         best,
         hasMoves: Array.isArray(p.moves) && p.moves.length > 0,
-        defLabel // Inject defensive data
+        defLabel 
       };
     })
     .sort((a, b) => (b.best ?? -1) - (a.best ?? -1));
@@ -294,7 +293,6 @@ function renderTypeMatchup(state) {
       label = `${r.best}x resisted move`;
     }
     
-    // Append the defensive data to the output
     body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: ${esc(label)}${esc(r.defLabel)}</div>`;
   }
   return body;
@@ -335,8 +333,6 @@ function renderLog(log) {
   }</div>`;
 }
 
-// Separate chat transcript: battle lines churn too fast to keep chat
-// interleaved without it scrolling away instantly.
 function renderChat(state) {
   const lines = (state.chat || []).slice(-15);
   let body = `<h2>Chat</h2>`;
@@ -390,7 +386,7 @@ export function renderHome(state) {
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p>Login error: ${esc(state.loginError)}</p>`;
 
-  body += `<p><a href="/">Refresh</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
+  body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -514,7 +510,6 @@ export function renderBattle(state) {
       });
       body += `<p><a href="/choose?value=${encodeURIComponent("default")}">Use default move</a></p>`;
 
-      // Terastallize: same moves, choice gets the "terastallize" suffix.
       if (canTera) {
         body += `<h2>Terastallize (${esc(String(canTera))})</h2>`;
         body += `<div class="muted">Use a move AND Terastallize this turn.</div>`;
@@ -544,7 +539,7 @@ export function renderBattle(state) {
 
   body += `<p><a href="/battle">Refresh</a> | <a href="/timer">${
     state.timerOn ? "Turn timer off" : "Turn timer on"
-  }</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
+  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -589,6 +584,38 @@ export function renderMoveInfo(move, moveId, state) {
   body += `<p><a href="/battle">Back to battle</a></p>`;
 
   return page(move.name || "Move info", body, 0);
+}
+
+export function renderDex(entry, q) {
+  let body = `<h1>Pok&eacute;dex</h1>`;
+  
+  body += `<form action="/dex" method="get">
+<div><input type="text" name="q" value="${esc(q || "")}" placeholder="Search Pok&eacute;mon"></div>
+<div><input type="submit" value="Search"></div>
+</form><hr>`;
+
+  if (q) {
+    if (!entry) {
+      body += `<p>No entry found for "${esc(q)}".</p>`;
+    } else {
+      const imgUrl = spriteUrl(entry.name, { anim: false });
+      if (imgUrl) body += `<div><img src="${esc(imgUrl)}" alt="" width="96"></div>`;
+      body += `<h2>${esc(entry.name)}</h2>`;
+      if (entry.types) body += `<div><strong>Types:</strong> <span class="chip">${esc(entry.types.join("/"))}</span></div>`;
+      if (entry.baseStats) {
+        body += `<div><strong>Stats:</strong> HP ${entry.baseStats.hp} / Atk ${entry.baseStats.atk} / Def ${entry.baseStats.def} / SpA ${entry.baseStats.spa} / SpD ${entry.baseStats.spd} / Spe ${entry.baseStats.spe}</div>`;
+      }
+      if (entry.abilities) {
+        const abs = Object.entries(entry.abilities).map(([k, v]) => `${v}${k === 'H' ? ' (Hidden)' : ''}`).join(", ");
+        body += `<div><strong>Abilities:</strong> ${esc(abs)}</div>`;
+      }
+    }
+    body += `<hr>`;
+  }
+  
+  body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
+  
+  return page(entry ? `Pok&eacute;dex: ${entry.name}` : "Pok&eacute;dex", body);
 }
 
 export function renderError(message) {

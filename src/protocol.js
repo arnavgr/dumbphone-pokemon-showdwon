@@ -19,9 +19,10 @@ export function parseLine(line) {
 }
 
 export function parseIdent(ident) {
-  const idx = ident.indexOf(": ");
-  if (idx === -1) return { side: ident, name: ident };
-  return { side: ident.slice(0, idx), name: ident.slice(idx + 2) };
+  const str = String(ident || "");
+  const idx = str.indexOf(": ");
+  if (idx === -1) return { side: str, name: str };
+  return { side: str.slice(0, idx), name: str.slice(idx + 2) };
 }
 
 function condText(cond) {
@@ -189,6 +190,14 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "-curestatus": {
       const p = parseIdent(parts[0]);
       return `${p.name} recovered from its status.`;
+    }
+    case "-start": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}: ${parts[1]} started.`;
+    }
+    case "-end": {
+      const p = parseIdent(parts[0]);
+      return `${p.name}'s ${parts[1]} ended.`;
     }
     case "-boost": {
       const p = parseIdent(parts[0]);

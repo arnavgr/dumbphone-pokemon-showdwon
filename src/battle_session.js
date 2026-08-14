@@ -15,14 +15,12 @@ import {
   renderError,
   renderLogin,
   renderMoveInfo,
+  renderDex,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
 const ANIMATED_SPRITES = true;
 
-// ---------------------------------------------------------------------------
-// Global Data Caches
-// ---------------------------------------------------------------------------
 let pokedexCache = null;
 let pokedexPromise = null;
 async function getPokedex() {
@@ -80,14 +78,9 @@ const DEFAULT_STATE = {
   upstreamCookie: null,
   challengesFrom: {},
   challengeTo: null,
-  // Saved account credentials so a fresh socket can silently re-login.
-  // Deliberately persisted: the DO's websocket dies whenever the isolate
-  // idles, and without re-auth the next search would run as a guest.
   loginName: null,
   loginPassword: null,
-  // side ("p1"/"p2") -> normalized species -> revealed info
   revealed: {},
-  // weather / terrains / per-side conditions
   field: { weather: null, fields: [], sides: {} },
 };
 
@@ -191,8 +184,6 @@ export class BattleSession extends DurableObject {
     const entry = dex[id] || {};
     const types = entry.types || [];
 
-    // Predicted Spe for the opponent panel: standard random-battle spread
-    // (85 IVs, 0 EVs, neutral nature), scaled by the level shown on switch-in.
     const baseStats = entry.baseStats || null;
     let predictedSpeed = null;
     if (baseStats && Number.isFinite(baseStats.spe) && level) {
@@ -216,6 +207,7 @@ export class BattleSession extends DurableObject {
       item: null,
       usedMoves: [],
       boosts: {},
+      volatiles: [],
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
       spriteBack: spriteUrl(species, { shiny, back: true, anim: ANIMATED_SPRITES }),
     };
@@ -226,8 +218,6 @@ export class BattleSession extends DurableObject {
     const mon = this.state_.active[p.side];
     if (mon) mon.condition = parts[1] || "";
   }
-
-  // --- Opponent revealed-team tracker -------------------------------------
 
   trackRevealed(parts) {
     const p = parseIdent(parts[0] || "");
@@ -331,9 +321,6 @@ export class BattleSession extends DurableObject {
     this.state_.notice = "Logged in.";
   }
 
-  // Silent re-login after a socket reconnect. All callers share one promise
-  // so concurrent triggers (challstr + updateuser + pendingAuth) can't
-  // double-fire, and a failed attempt disables retries until a manual login.
   async autoRelogin() {
     if (this.relogDisabled) return;
     const { loginName, loginPassword } = this.state_;
@@ -355,7 +342,7 @@ export class BattleSession extends DurableObject {
   }
 
   async ensureConnected() {
-    if (this.ws && this.ws.readyState === 1 /* OPEN */) {
+    if (this.ws && this.ws.readyState === 1) {
       return;
     }
     if (!this.state_.upstreamCookie) {
@@ -389,9 +376,6 @@ export class BattleSession extends DurableObject {
       ws.send(`|/join ${this.state_.roomId}`);
     }
 
-    // A brand-new socket is always an anonymous guest session. If we have
-    // saved credentials, re-auth immediately so identity-sensitive commands
-    // (search/challenge/accept) don't fire as Guest.
     if (this.state_.loginName && this.state_.loginPassword) {
       this.pendingAuth = this.autoRelogin();
     }
@@ -430,8 +414,7 @@ export class BattleSession extends DurableObject {
   }
 
   async onSocketMessage(message) {
-    const text =
-      typeof message === "string" ? message : new TextDecoder().decode(message);
+    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
     const { roomId, lines } = splitFrame(text);
     for (const rawLine of lines) {
       await this.handleLine(roomId, rawLine);
@@ -476,8 +459,6 @@ export class BattleSession extends DurableObject {
         const isGuest = /^guest/i.test(name);
         this.state_.username = name;
         this.state_.loggedIn = !isGuest;
-        // Demoted to guest mid-session (e.g. after a silent reconnect) while
-        // we hold credentials -> re-auth instead of staying logged out.
         if (isGuest && this.state_.loginName && this.state_.loginPassword) {
           await this.autoRelogin();
         }
@@ -544,8 +525,6 @@ export class BattleSession extends DurableObject {
           const dex = await getPokedex();
           const movesData = await getMoves();
 
-          // moveTypes only counts DAMAGING moves (status moves excluded),
-          // which is what powers the "who hits hardest" ranking.
           if (req.side && req.side.pokemon) {
             for (const p of req.side.pokemon) {
               const species = String(p.details || "").split(",")[0].trim();
@@ -566,9 +545,6 @@ export class BattleSession extends DurableObject {
             }
           }
 
-          // Enrich active move choices; attach effectiveness vs the
-          // opponent's CURRENT types (tera-aware). req.active[0] also
-          // carries canTerastallize, which the UI renders as extra links.
           const oppTypes = this.oppActiveInfo()?.types || [];
           if (req.active) {
             for (const active of req.active) {
@@ -670,6 +646,33 @@ export class BattleSession extends DurableObject {
         break;
       }
 
+      case "-start": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          const effect = parts[1];
+          if (mon && effect) {
+            mon.volatiles = mon.volatiles || [];
+            if (!mon.volatiles.includes(effect)) mon.volatiles.push(effect);
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
+      case "-end": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const mon = this.state_.active[p.side];
+          const effect = parts[1];
+          if (mon && effect && mon.volatiles) {
+            mon.volatiles = mon.volatiles.filter((v) => v !== effect);
+          }
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
       case "-boost":
       case "-unboost": {
         if (inBattle) this.adjustBoosts(parts, type === "-unboost" ? "down" : "up");
@@ -720,7 +723,6 @@ export class BattleSession extends DurableObject {
       }
 
       case "-enditem": {
-        // Consumed / knocked off -> the mon no longer holds it.
         if (inBattle) {
           const p = parseIdent(parts[0] || "");
           this.revealMonDetail(p.side, "item", null);
@@ -860,7 +862,6 @@ export class BattleSession extends DurableObject {
       case "c":
       case "chat":
       case "c:": {
-        // Chat goes to its own transcript, not the battle log.
         this.pushChat(formatBattleLine(type, parts, mySide));
         break;
       }
@@ -920,8 +921,6 @@ export class BattleSession extends DurableObject {
   async fetch(request) {
     try {
       await this.ensureConnected();
-      // If a reconnect kicked off a silent re-login, wait for it so
-      // identity-sensitive commands below land under the account, not Guest.
       if (this.pendingAuth) {
         const p = this.pendingAuth;
         this.pendingAuth = null;
@@ -931,9 +930,32 @@ export class BattleSession extends DurableObject {
 
       if (url.pathname === "/search") {
         const format = url.searchParams.get("format") || "gen9randombattle";
+        try { this.send(`|/cancelsearch`); } catch {}
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
-        this.state_.notice = `Searching for ${format}...`;
+        
+        const hadBattle = !!(this.state_.roomId && !this.state_.ended);
+        const deadline = Date.now() + 5000;
+        let ok = false;
+        let instantMatch = false;
+
+        while (Date.now() < deadline) {
+          if ((this.state_.searching || []).includes(format)) { ok = true; break; }
+          if (!hadBattle && this.state_.roomId && !this.state_.ended) { 
+             ok = true; 
+             instantMatch = true; 
+             break; 
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        
+        if (instantMatch) {
+          this.state_.notice = null;
+          await this.save();
+          return Response.redirect(new URL("/battle", url), 302);
+        }
+        
+        this.state_.notice = ok ? `Searching for ${format}...` : `Search failed to initialize.`;
         await this.save();
         return Response.redirect(new URL("/", url), 302);
       }
@@ -1044,9 +1066,16 @@ export class BattleSession extends DurableObject {
         );
       }
 
+      if (url.pathname === "/dex") {
+        const q = url.searchParams.get("q") || "";
+        const dex = await getPokedex();
+        const id = normalizeName(q);
+        const entry = id ? dex[id] : null;
+        return this.htmlResponse(renderDex(entry, q));
+      }
+
       if (url.pathname === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
-          // Send explicit absolute commands instead of a bare toggle
           const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
           try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
