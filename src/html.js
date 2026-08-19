@@ -1,4 +1,4 @@
-import { spriteUrl, typeEffectiveness } from "./protocol.js";
+import { spriteUrl, typeEffectiveness, typeChartTable } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
@@ -36,6 +36,7 @@ h1{font-size:18px;margin:4px 0}
 h2{font-size:15px;margin:12px 0 4px}
 .muted{color:#999;font-size:12px}
 .chip{display:inline-block;border:1px solid #555;border-radius:4px;padding:0 4px;margin:0 4px 2px 0;font-size:12px}
+code{background:#222;padding:1px 4px;border-radius:3px;font-size:13px}
 .hpbar{font-weight:bold}
 a.row{display:block;border:1px solid #444;border-radius:6px;padding:6px;margin:6px 0;text-decoration:none;background:#1c1c22;color:#eee}
 a.row img{display:block;margin:0 auto 4px}
@@ -191,7 +192,11 @@ function renderRevealed(state) {
     const isActive =
       oppActive && e.species === oppActive.species && oppActive.condition !== "0 fnt";
     const tags = [e.ability, e.item].filter(Boolean).join(" / ");
-    body += `<div>- ${esc(e.species)}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
+    const typesChip =
+      e.types && e.types.length
+        ? ` <span class="chip">${esc(e.types.join("/"))}${e.teraType ? " Tera" : ""}</span>`
+        : "";
+    body += `<div>- ${esc(e.species)}${typesChip}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
       isActive ? " <strong>(active)</strong>" : ""
     } - ${hpBar(e.condition) || "-"}${
       tags ? ` <span class="muted">[${esc(tags)}]</span>` : ""
@@ -308,6 +313,14 @@ function renderMoveDesc(m) {
   return `<div class="muted">${esc(text)}${moreLink}</div>`;
 }
 
+function movesLine(moveDetails) {
+  if (!moveDetails || !moveDetails.length) return "";
+  const text = moveDetails
+    .map((m) => `${m.name}${m.type ? ` [${m.type}]` : ""}`)
+    .join(", ");
+  return `<br><span class="muted">Moves: ${esc(text)}</span>`;
+}
+
 function switchCard(p, i, href, showNum) {
   const species = (p.details || "").split(",")[0];
   const imgUrl = spriteUrl(species, { anim: false });
@@ -322,7 +335,7 @@ function switchCard(p, i, href, showNum) {
 <img src="${esc(imgUrl)}" alt="" width="96">
 <span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${
     stats ? `<br><span class="muted">Atk/Def/SpA/SpD/Spe: ${esc(stats)}</span>` : ""
-  }${extra}</span>
+  }${extra}${movesLine(p.moveDetails)}</span>
 </a>`;
 }
 
@@ -408,7 +421,7 @@ export function renderHome(state) {
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p style="color:#b22">Login error: ${esc(state.loginError)}</p>`;
 
-  body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
+  body += `<p><a href="/">Refresh</a> | <a href="/typechart">Type Chart</a> | <a href="/commands">Commands</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -479,6 +492,7 @@ export function renderBattle(state) {
   body += renderRevealed(state);
   body += renderField(state);
   body += renderTypeMatchup(state);
+  body += `<p class="muted"><a href="/typechart">See full type chart</a></p>`;
 
   body += `<h2>Log</h2>${renderLog(state.log)}`;
   body += renderChat(state);
@@ -567,7 +581,7 @@ export function renderBattle(state) {
 
   body += `<p><a href="/battle">Refresh</a> | <a href="/timer">${
     state.timerOn ? "Turn timer off" : "Turn timer on"
-  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
+  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/commands">Commands</a> | <a href="/debug">Debug</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -644,6 +658,85 @@ export function renderDex(entry, q) {
   body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
   
   return page(entry ? `Pok&eacute;dex: ${entry.name}` : "Pok&eacute;dex", body);
+}
+
+const BATTLE_COMMANDS = [
+  ["/dt [Pokemon, Move, Item, or Ability]", "Full data on the thing: base stats, typing, abilities, or for a move its power/accuracy/effect."],
+  ["/weakness [type or Pokemon]", "All the type matchups against a type (or a Pokemon's typing)."],
+  ["/coverage [type]", "All the type matchups for a type - what it hits well."],
+  ["/effectiveness [move], [Pokemon or type]", "Effectiveness of one specific move against one specific target."],
+  ["/calc", "Link to the Showdown damage calculator."],
+  ["/statcalc [level] [base stat] [IVs] [nature] [EVs] [modifier]", "Works out a Pokemon's actual stat from those inputs."],
+  ["/savereplay", "Saves a shareable replay link for the battle you're in."],
+  ["/modjoin +", "Makes the battle private/spectator-restricted - good if someone's spamming."],
+  ["/roomvoice [player]", "Lets a specific person join and talk even with /modjoin + on."],
+  ["/hideroom", "Hides the battle from the public battle list. Still reachable by direct link."],
+  ["/ionext", "Auto-applies /modjoin + to your next battle. Useful if someone's trying to snipe you."],
+];
+
+const TEAMBUILDING_COMMANDS = [
+  ["/ds [criteria], [criteria]", "(/dexsearch) Finds Pokemon matching criteria like type, ability, or stats. Use /help ds for the full list."],
+  ["/ms [criteria], [criteria]", "(/movesearch) Finds moves matching criteria. Use /help ms for the full list."],
+  ["/is [keyword]", "(/itemsearch) Finds items matching a keyword - handy for finding all berries of a type."],
+  ["/analysis [Pokemon]", "Link to that Pokemon's Smogon analysis page with common sets - great for beginners."],
+  ["/learn [Pokemon], [move]", "Checks whether a Pokemon can learn a given move."],
+  ["/randompokemon [number], [criteria]", "Generates random Pokemon matching criteria."],
+  ["/randommove [criteria]", "Generates a random move matching criteria."],
+];
+
+const OTHER_USEFUL_COMMANDS = [
+  ["/rating [username]", "(or /rank) Shows a player's ladder rating."],
+  ["/nick [new name]", "Changes your display name (resets your rating, keeps your old name's history)."],
+  ["/whois [username]", "Basic info about a user."],
+];
+
+function commandTable(rows) {
+  return rows
+    .map(
+      ([cmd, desc]) =>
+        `<div><code>${esc(cmd)}</code><div class="muted">${esc(desc)}</div></div>`
+    )
+    .join("<hr>");
+}
+
+export function renderCommands() {
+  let body = `<h1>Commands</h1>`;
+  body += `<p class="muted">These are Showdown's own chat commands, not app features - type them straight into the chat box during a battle and the reply shows up in your chat log. Data/teambuilding commands (like /dt or /learn) also work fine outside a battle on the real Showdown site, but this app's chat box is currently only available while you're in a battle room.</p>`;
+
+  body += `<h2>Battle commands</h2>`;
+  body += commandTable(BATTLE_COMMANDS);
+
+  body += `<h2>Teambuilding &amp; info commands</h2>`;
+  body += commandTable(TEAMBUILDING_COMMANDS);
+
+  body += `<h2>Other useful commands</h2>`;
+  body += commandTable(OTHER_USEFUL_COMMANDS);
+
+  body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
+  return page("Commands", body);
+}
+
+export function renderTypeChart() {
+  const rows = typeChartTable();
+
+  let body = `<h1>Type Chart</h1>`;
+  body += `<p class="muted">For each type, what's super effective against it, what it resists, and what can't touch it at all. This is per single type - for a dual-type Pok&eacute;mon, combine both of its type's rows (a move that's on both lists, e.g. weak on one and resisted on the other, cancels out to neutral).</p>`;
+
+  for (const r of rows) {
+    body += `<h2>${esc(r.type)}</h2>`;
+    body += `<div>Weak to (2x or more): ${
+      r.weakTo.length ? r.weakTo.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+    body += `<div>Resists (0.5x): ${
+      r.resists.length ? r.resists.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+    body += `<div>Immune to (0x): ${
+      r.immuneTo.length ? r.immuneTo.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+  }
+
+  body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
+  return page("Type Chart", body);
 }
 
 export function renderDebug(state, extra) {

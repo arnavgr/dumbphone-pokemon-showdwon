@@ -21,6 +21,8 @@ import {
   renderMoveInfo,
   renderDex,
   renderDebug,
+  renderTypeChart,
+  renderCommands,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "wss://sim3.psim.us/showdown/websocket";
@@ -237,7 +239,7 @@ export class BattleSession {
     const dex = await getPokedex();
     const id = normalizeName(species);
     const entry = dex[id] || {};
-    const types = entry.types || [];
+    let types = entry.types || [];
 
     const baseStats = entry.baseStats || null;
     let predictedSpeed = null;
@@ -248,6 +250,14 @@ export class BattleSession {
       ? [...new Set(Object.values(entry.abilities))]
       : [];
 
+    // If this Pokemon was already revealed earlier in the battle (e.g. it
+    // Terastallized before switching out), restore that instead of
+    // resetting to its base dex data. Terastallization lasts the whole
+    // battle, so a switched-out mon keeps its Tera type when it comes back.
+    const revealedEntry = this.state_.revealed[sideKey(p.side)]?.[id];
+    const teraType = revealedEntry?.teraType || null;
+    if (teraType) types = [teraType];
+
     this.state_.active[p.side] = {
       slot: p.side,
       nickname: p.name,
@@ -256,11 +266,12 @@ export class BattleSession {
       shiny,
       level,
       types,
+      teraType,
       predictedSpeed,
       possibleAbilities,
-      ability: null,
-      item: null,
-      usedMoves: [],
+      ability: revealedEntry?.ability || null,
+      item: revealedEntry?.item || null,
+      usedMoves: revealedEntry?.usedMoves ? [...revealedEntry.usedMoves] : [],
       boosts: {},
       volatiles: [],
       spriteFront: spriteUrl(species, { shiny, back: false, anim: ANIMATED_SPRITES }),
@@ -282,11 +293,16 @@ export class BattleSession {
     const sideMap = this.state_.revealed[side] || (this.state_.revealed[side] = {});
     const key = normalizeName(species);
     const existing = sideMap[key];
+    // upsertActive() runs just before this and already resolved the
+    // correct types (including any Tera override), so reuse it here.
+    const activeMon = this.state_.active[p.side];
     sideMap[key] = {
       species,
       nickname: p.name,
       level,
       condition: parts[2] || existing?.condition || "",
+      types: (activeMon && activeMon.types) || existing?.types || [],
+      teraType: activeMon?.teraType || existing?.teraType || null,
       ability: existing?.ability || null,
       item: existing?.item || null,
       usedMoves: existing?.usedMoves || [],
@@ -759,6 +775,15 @@ export class BattleSession {
                       .filter(Boolean)
                   ),
                 ];
+                p.moveDetails = p.moves.map((mId) => {
+                  const d = movesData[mId];
+                  return {
+                    id: mId,
+                    name: d?.name || mId,
+                    type: d?.type || null,
+                    category: d?.category || null,
+                  };
+                });
               }
             }
           }
@@ -956,6 +981,8 @@ export class BattleSession {
           if (mon && teraType) {
             mon.types = [teraType];
             mon.teraType = teraType;
+            const entry = this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
+            if (entry) entry.teraType = teraType;
           }
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
@@ -971,7 +998,11 @@ export class BattleSession {
             const dex = await getPokedex();
             const entry = dex[normalizeName(newSpecies)] || {};
             mon.species = newSpecies;
-            if (entry.types) mon.types = entry.types;
+            if (mon.teraType) {
+              mon.types = [mon.teraType];
+            } else if (entry.types) {
+              mon.types = entry.types;
+            }
             if (entry.abilities) {
               mon.possibleAbilities = [...new Set(Object.values(entry.abilities))];
             }
@@ -990,6 +1021,8 @@ export class BattleSession {
                   nickname: mon.nickname,
                   level: mon.level,
                   condition: mon.condition,
+                  types: mon.types || [],
+                  teraType: mon.teraType || null,
                   ability: mon.ability || null,
                   item: mon.item || null,
                   usedMoves: [...(mon.usedMoves || [])],
@@ -1299,6 +1332,14 @@ export class BattleSession {
         const moveId = req.query.move || "";
         const movesData = await getMoves();
         return res.send(renderMoveInfo(movesData[moveId] || null, moveId, this.state_));
+      }
+
+      if (path === "/typechart") {
+        return res.send(renderTypeChart());
+      }
+
+      if (path === "/commands") {
+        return res.send(renderCommands());
       }
 
       if (path === "/dex") {

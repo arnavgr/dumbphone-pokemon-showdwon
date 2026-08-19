@@ -12,21 +12,20 @@ CloudPhone's browser can't hold a WebSocket connection or run real client-side
 JS, so it never talks to Showdown directly. Instead:
 
 ```
-CloudPhone browser  <--plain HTTP, links only-->  Cloudflare Worker
+CloudPhone browser  <--plain HTTP, links only-->  Render Node.js web service
                                                           |
-                                              Durable Object (1 per session)
+                                        In-memory BattleSession (1 per
+                                        session cookie, keyed in a Map)
                                                           |
-                                          persistent WebSocket
+                                     persistent WebSocket, via outbound proxy
                                                           |
                                           wss://sim3.psim.us/showdown/websocket
                                               (the real Showdown server)
 ```
 
-Each browser session gets a cookie (`sid`) that maps to one Durable Object.
-That object holds the live WebSocket to Showdown, using the [Hibernatable
-WebSockets API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
-so the connection survives between your (infrequent, manual) page loads
-without you paying for compute while nothing's happening. Every page is
+Each browser session gets a cookie (`sid`) that maps to one `BattleSession`
+object held in memory by the Node process. That object holds the live
+WebSocket to Showdown for as long as the process stays up. Every page is
 server-rendered HTML with plain `<a href>` links (and a couple of simple
 `<form>`s for text input) for moves/switches/challenges, no client-side JS at
 all -- same approach as your dumbphone chess site. The home page also has a
@@ -44,40 +43,65 @@ That gets you the whole current Pokedex without building a team editor for a
 keypad phone. (If Showdown's popular-format lineup shifts over time, swap the
 three entries in `RANDOM_FORMATS` at the top of `src/html.js`.)
 
-## Setup (dashboard + GitHub only, no wrangler CLI)
+### Why this runs on Render instead of Cloudflare Workers
 
-This uses Cloudflare's **Workers Builds** Git integration, which connects a
-repo and redeploys automatically on every push -- no CLI, no API token
-secrets to manage yourself.
+This project originally ran on Cloudflare Workers + Durable Objects, but
+Showdown flags Cloudflare's outbound edge IPs as proxy/datacenter addresses
+and disconnects immediately, before a session can ever stabilize -- no login
+or reconnect fix gets around that, since it's blocked at the IP level. Render
+gives a normal long-running Node process instead of a stateless edge
+function, which sidesteps the Durable Object constraints entirely, but the
+underlying IP-reputation problem doesn't automatically go away just by
+switching host -- Render's shared IPs can get flagged the same way. That's
+what `PROXY_URL` (below) is for: it routes the WebSocket, and the HTTP login
+call, out through a separate proxy with IPs Showdown doesn't flag.
+
+### A note on session persistence
+
+Sessions now live in an in-memory `Map` inside the Node process (see
+`server.js`), not in Durable Object storage. That means:
+
+- Every active session -- including anyone currently logged in -- is lost on
+  a restart, redeploy, or crash of the Render service.
+- This only works as a **single instance**. If you scale to more than one
+  Render instance, a browser's requests could land on an instance that
+  doesn't have its session, and account state would appear to reset in the
+  middle of a battle. Keep this at one instance.
+
+## Setup (Render + GitHub)
 
 1. Create a new GitHub repo and add all the files in this folder to it,
-   keeping the folder structure (`src/` as a subfolder, `wrangler.toml` and
-   `package.json` at the repo root). GitHub's web upload page
-   (**Add file > Upload files**) accepts multiple files/folders dragged in
-   at once and works fine from a phone browser.
-2. In the Cloudflare dashboard, go to **Workers & Pages**.
-3. Select **Create application** > next to **Import a repository**, select
-   **Get started**.
-4. Choose your **Git account** (authorize GitHub the first time you do
-   this), then pick the repo you just created.
-5. Cloudflare will detect `wrangler.toml` and pre-fill the build settings
-   (deploy command defaults to `npx wrangler deploy`, which is correct here
-   -- leave the build command blank, there's no framework to compile).
-   Make sure the **Worker name** it assigns matches the `name` in
-   `wrangler.toml` (`ps-cloudphone`) -- if it doesn't, edit one to match the
-   other, or the build will fail.
-6. Select **Save and Deploy**. The first deploy also provisions the
-   Durable Object namespace (the `[[migrations]]` block in `wrangler.toml`
-   handles that automatically).
-7. Open the `*.workers.dev` URL it gives you on CloudPhone.
+   keeping the folder structure (`src/` as a subfolder, `package.json` and
+   `server.js` at the repo root). GitHub's web upload page (**Add file >
+   Upload files**) accepts multiple files/folders dragged in at once and
+   works fine from a phone browser.
+2. Get an HTTP/HTTPS proxy with IPs that aren't flagged as datacenter/proxy
+   by Pokemon Showdown (a paid rotating or static residential proxy plan --
+   Webshare and similar providers work). You'll need the proxy URL in the
+   form `http://username:password@host:port`.
+3. In the Render dashboard, select **New > Web Service** and connect the
+   GitHub repo you just created.
+4. Configure the service:
+   - **Runtime**: Node
+   - **Build Command**: `npm install`
+   - **Start Command**: `npm start` (runs `node server.js`)
+5. Under the service's **Environment** tab, add an environment variable:
+   - `PROXY_URL` = your proxy URL from step 2, e.g.
+     `http://username:password@host:port`
 
-From then on, every push to your default branch redeploys automatically.
-You can watch build logs under the Worker's **Deployments** tab if
-something fails.
+   This is required -- the app throws a startup error and refuses to boot if
+   `PROXY_URL` isn't set, rather than silently running unproxied and getting
+   flagged. **Never commit a proxy URL into the source** -- it's a public
+   GitHub repo, so anything hardcoded there is exposed the moment it's
+   pushed. If a proxy credential ever does end up committed, rotate it with
+   your proxy provider immediately, even after removing it from the code.
+6. Deploy. Render will give you a `*.onrender.com` URL once the build
+   finishes -- watch the deploy logs if the service fails to start (a
+   missing `PROXY_URL` will show up there immediately).
+7. Open that URL on CloudPhone.
 
-Durable Objects with SQLite storage (what this uses) are available on
-Cloudflare's **free** Workers plan, so this should cost nothing at your
-scale.
+From then on, every push to your connected branch redeploys automatically
+(this will drop any active sessions, per the note above).
 
 ## Battle-page intel
 
@@ -127,9 +151,12 @@ The home page has a "Battle a friend" section:
 
 ## File map
 
-- `src/index.js` -- Worker entry, session cookie, routes to the Durable Object.
-- `src/battle_session.js` -- the Durable Object: owns the WebSocket, parses
-  incoming protocol lines, exposes `/`, `/search`, `/battle`, `/choose`,
-  `/challenge`, `/accept`, `/reject`, etc.
+- `server.js` -- Express entry point: same-origin sprite proxy (`/sprite/*`),
+  session cookie handling, and routing each request to the right in-memory
+  `BattleSession`.
+- `src/battle_session.js` -- owns the WebSocket to Showdown (via the outbound
+  proxy), parses incoming protocol lines in order, and handles `/`,
+  `/search`, `/battle`, `/choose`, `/challenge`, `/accept`, `/reject`,
+  `/login`, `/debug`, etc.
 - `src/protocol.js` -- line parsing + human-readable log formatting.
 - `src/html.js` -- plain server-rendered HTML pages, no CSS/JS frameworks.

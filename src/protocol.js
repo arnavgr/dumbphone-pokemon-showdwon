@@ -111,6 +111,28 @@ export function typeEffectiveness(moveType, defenderTypes) {
   return mult;
 }
 
+export const ALL_TYPES = Object.keys(TYPE_CHART);
+
+// Beginner-friendly reference table: for each single type, which attacking
+// types are super effective against it (weakTo), resisted by it (resists),
+// or have no effect on it (immuneTo). Computed from TYPE_CHART, which is
+// keyed by [attackingType][defendingType].
+export function typeChartTable() {
+  return ALL_TYPES.map((defType) => {
+    const weakTo = [];
+    const resists = [];
+    const immuneTo = [];
+    for (const atkType of ALL_TYPES) {
+      const chart = TYPE_CHART[atkType];
+      const mult = chart && chart[defType] !== undefined ? chart[defType] : 1;
+      if (mult === 0) immuneTo.push(atkType);
+      else if (mult > 1) weakTo.push(atkType);
+      else if (mult < 1) resists.push(atkType);
+    }
+    return { type: defType, weakTo, resists, immuneTo };
+  });
+}
+
 function stripRank(user) {
   return String(user || "").replace(/^[^A-Za-z0-9]+/, "");
 }
