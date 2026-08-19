@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import crypto from "crypto";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import {
@@ -28,11 +29,6 @@ const ANIMATED_SPRITES = true;
 // ---------------------------------------------------------------------------
 // Outbound Proxy Configuration
 // ---------------------------------------------------------------------------
-// This MUST come from an environment variable, not a literal in source. This
-// file gets pushed to a public GitHub repo (see README setup steps), so
-// anything hardcoded here is public the moment it's committed. Set PROXY_URL
-// in Render's dashboard under the service's "Environment" tab instead, e.g.
-// http://user:pass@host:port
 const PROXY_URL = process.env.PROXY_URL;
 if (!PROXY_URL) {
   throw new Error(
@@ -41,16 +37,8 @@ if (!PROXY_URL) {
   );
 }
 
-// Used for the persistent WebSocket connection to Showdown.
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
-// Used for the one HTTP call that also needs to go out through the proxy:
-// the login POST to action.php. (Previously only the WebSocket was proxied,
-// which meant the login handshake could still get flagged even when the
-// battle socket connected fine, since it went out on Render's un-proxied
-// IP.) Deliberately NOT applied globally to all fetch() calls -- the sprite
-// proxy and the pokedex/moves data pulls are plain public asset fetches
-// that don't need to eat into proxy bandwidth.
 function buildProxyDispatcher(proxyUrlStr) {
   const u = new URL(proxyUrlStr);
   const uri = `${u.protocol}//${u.host}`;
@@ -62,6 +50,36 @@ function buildProxyDispatcher(proxyUrlStr) {
   return new ProxyAgent(opts);
 }
 const proxyDispatcher = buildProxyDispatcher(PROXY_URL);
+
+// ---------------------------------------------------------------------------
+// Cookie Persistence Encryption Helpers
+// ---------------------------------------------------------------------------
+const COOKIE_SECRET = process.env.COOKIE_SECRET || "ps-cloudphone-default-secret-salt-key";
+const CIPHER_KEY = crypto.createHash("sha256").update(COOKIE_SECRET).digest();
+
+function encryptCredentials(username, password) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", CIPHER_KEY, iv);
+  const payload = JSON.stringify({ u: username, p: password });
+  let enc = cipher.update(payload, "utf8", "hex");
+  enc += cipher.final("hex");
+  const tag = cipher.getAuthTag().toString("hex");
+  return `${iv.toString("hex")}:${tag}:${enc}`;
+}
+
+function decryptCredentials(cookieStr) {
+  try {
+    const [ivHex, tagHex, enc] = String(cookieStr || "").split(":");
+    if (!ivHex || !tagHex || !enc) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", CIPHER_KEY, Buffer.from(ivHex, "hex"));
+    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+    let dec = decipher.update(enc, "hex", "utf8");
+    dec += decipher.final("utf8");
+    return JSON.parse(dec);
+  } catch {
+    return null;
+  }
+}
 
 const RECONNECT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];
 const QUICK_DROP_THRESHOLD_MS = 15000;
@@ -484,12 +502,6 @@ export class BattleSession {
     ws.on("message", (data) => {
       const text = data.toString();
       const { roomId, lines } = splitFrame(text);
-      // handleLine is async (it awaits pokedex/moves lookups, etc). Chaining
-      // onto this._messageQueue instead of firing-and-forgetting each call
-      // guarantees lines are handled strictly in the order Showdown sent
-      // them, both within a frame and across separate "message" events --
-      // otherwise a later line (e.g. -damage) could get applied before an
-      // earlier one (e.g. switch) finishes its own awaits, corrupting state.
       this._messageQueue = this._messageQueue
         .then(async () => {
           for (const rawLine of lines) {
@@ -1116,6 +1128,15 @@ export class BattleSession {
 
   async handleRequest(req, res) {
     try {
+      // Auto-hydrate login state from encrypted cookie if memory state was reset by server sleep
+      if (!this.state_.loginName && req.cookies?.ps_auth) {
+        const creds = decryptCredentials(req.cookies.ps_auth);
+        if (creds?.u && creds?.p) {
+          this.state_.loginName = creds.u;
+          this.state_.loginPassword = creds.p;
+        }
+      }
+
       await this.ensureConnected();
 
       const path = req.path;
@@ -1339,6 +1360,15 @@ export class BattleSession {
           try {
             this.relogDisabled = false;
             await this.login(username, password);
+
+            // Persist encrypted login credentials across server sleep cycles
+            res.cookie("ps_auth", encryptCredentials(username, password), {
+              maxAge: 30 * 24 * 60 * 60 * 1000,
+              httpOnly: true,
+              sameSite: "lax",
+              secure: req.secure,
+              path: "/",
+            });
           } catch (err) {
             this.state_.loginError = err.message || String(err);
           }
@@ -1359,6 +1389,9 @@ export class BattleSession {
         this.state_.connected = false;
         this.relogDisabled = false;
         this.state_.notice = "Logged out.";
+
+        // Clear auth cookie
+        res.clearCookie("ps_auth", { path: "/" });
         return res.redirect("/");
       }
 
