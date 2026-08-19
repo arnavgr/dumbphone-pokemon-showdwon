@@ -251,7 +251,7 @@ function renderTypeMatchup(state) {
 
       const myTypes = p.types || [];
       const weakTo = [];
-      const strongAgainst = [];
+      const resists = [];
       const immuneTo = [];
 
       if (myTypes.length) {
@@ -259,14 +259,14 @@ function renderTypeMatchup(state) {
           const defEff = typeEffectiveness(oppType, myTypes);
           if (defEff > 1) weakTo.push(oppType.toLowerCase());
           else if (defEff === 0) immuneTo.push(oppType.toLowerCase());
-          else if (defEff < 1) strongAgainst.push(oppType.toLowerCase());
+          else if (defEff < 1) resists.push(oppType.toLowerCase());
         }
       }
 
       const defParts = [];
+      if (weakTo.length) defParts.push(`weak to ${weakTo.join("/")}`);
+      if (resists.length) defParts.push(`resists ${resists.join("/")}`);
       if (immuneTo.length) defParts.push(`immune to ${immuneTo.join("/")}`);
-      if (weakTo.length) defParts.push(`weak against ${weakTo.join("/")}`);
-      if (strongAgainst.length) defParts.push(`strong against ${strongAgainst.join("/")}`);
 
       const defLabel = defParts.length ? `, ${defParts.join(", ")}` : "";
 
@@ -325,6 +325,7 @@ function switchCard(p, i, href, showNum) {
   const species = (p.details || "").split(",")[0];
   const imgUrl = spriteUrl(species, { anim: false });
   const typesText = p.types && p.types.length ? ` [${esc(p.types.join("/"))}]` : "";
+  const teraText = p.teraType ? ` <span class="chip">Tera: ${esc(p.teraType)}</span>` : "";
   const stats = statsLine(p.stats);
   const cond = p.condition ? ` ${hpBar(p.condition)}` : "";
   const bits = [];
@@ -333,7 +334,7 @@ function switchCard(p, i, href, showNum) {
   const extra = bits.length ? `<br><span class="muted">${esc(bits.join(" | "))}</span>` : "";
   return `<a class="row" href="${esc(href)}">
 <img src="${esc(imgUrl)}" alt="" width="96">
-<span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${
+<span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${teraText}${
     stats ? `<br><span class="muted">Atk/Def/SpA/SpD/Spe: ${esc(stats)}</span>` : ""
   }${extra}${movesLine(p.moveDetails)}</span>
 </a>`;
