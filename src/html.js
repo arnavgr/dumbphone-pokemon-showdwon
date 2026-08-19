@@ -40,6 +40,7 @@ h2{font-size:15px;margin:12px 0 4px}
 a.row{display:block;border:1px solid #444;border-radius:6px;padding:6px;margin:6px 0;text-decoration:none;background:#1c1c22;color:#eee}
 a.row img{display:block;margin:0 auto 4px}
 .log{font-size:13px;border:1px solid #333;border-radius:6px;padding:6px}
+.banner{background:#2a2510;border:1px solid #775500;padding:6px;border-radius:4px;margin:6px 0;font-size:12px}
 input[type=text],input[type=password],select{font-size:16px;width:92%}
 input[type=submit]{font-size:16px}
 form{margin:6px 0}
@@ -376,6 +377,21 @@ function renderChallenges(state) {
   return body;
 }
 
+function renderIpLockBanner(state) {
+  if (!state.ipLocked) return "";
+  const since = state.ipLockedAt
+    ? Math.max(0, Math.round((Date.now() - state.ipLockedAt) / 1000))
+    : null;
+  return `<div class="banner" style="background:#2a1010;border-color:#772222">
+<strong>Connection flagged as a proxy by Showdown</strong>
+<div>${esc(state.ipLockedMsg || "Showdown is treating this connection as a proxy and may close it.")}</div>
+<div class="muted">This is Cloudflare's shared IP range being flagged, not your account specifically. The app reconnects itself in the background with a growing delay if the connection keeps dropping quickly, and gives up on retrying automatically after a while rather than repeatedly hitting a connection that's been flagged${
+    since !== null ? ` (first seen ${since}s ago)` : ""
+  }. Loading any page, or the link below, always tries again immediately.</div>
+<div><a href="/reconnect">Retry connection now</a></div>
+</div>`;
+}
+
 export function renderHome(state) {
   let body = `<h1>PS CloudPhone</h1>`;
 
@@ -383,9 +399,14 @@ export function renderHome(state) {
     state.connected ? `Connected as ${esc(state.username || "guest")}` : "Not connected yet."
   }${state.loggedIn ? " (logged in)" : ""}</div>`;
 
+  body += renderIpLockBanner(state);
+
+  if (state.serverMsg && !state.ipLocked) {
+    body += `<div class="banner"><strong>Notice:</strong> ${esc(state.serverMsg)}<br><a href="/dismiss?from=/">[OK / Dismiss]</a></div>`;
+  }
+
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p style="color:#b22">Login error: ${esc(state.loginError)}</p>`;
-  if (state.serverMsg) body += `<p><b>Server:</b> ${esc(state.serverMsg)}</p>`;
 
   body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
@@ -418,7 +439,7 @@ export function renderHome(state) {
     (state.searching && state.searching.length > 0) ||
     Boolean(state.challengeTo && state.challengeTo.to);
 
-  return page("PS CloudPhone", body, shouldAutoRefresh ? 8 : 0);
+  return page("PS CloudPhone", body, shouldAutoRefresh ? 6 : 0);
 }
 
 export function renderLogin(state) {
@@ -441,6 +462,12 @@ export function renderBattle(state) {
   let body = `<h1>${esc(state.roomTitle || "Battle")}</h1>`;
   body += `<div>Turn ${state.turn || 0}${state.ended ? " - battle over" : ""}</div>`;
   body += `<div>Timer: <strong>${state.timerOn ? "ON" : "OFF"}</strong></div>`;
+
+  body += renderIpLockBanner(state);
+
+  if (state.serverMsg && !state.ipLocked) {
+    body += `<div class="banner"><strong>Notice:</strong> ${esc(state.serverMsg)}<br><a href="/dismiss?from=/battle">[OK / Dismiss]</a></div>`;
+  }
 
   if (!state.mySide) body += `<div class="muted">Detecting your side...</div>`;
 
@@ -631,12 +658,18 @@ export function renderDebug(state, extra) {
   body += `Logged In (named=1): ${state.loggedIn}\n`;
   body += `Saved Account: ${state.loginName || "none"}\n`;
   body += `Fresh Challstr: ${extra.freshChallstr}\n`;
+  body += `Connecting Now: ${extra.connectingNow}\n`;
+  body += `Pending Login Confirm: ${extra.pendingLoginName}\n`;
+  body += `Consecutive Quick Drops: ${extra.consecutiveQuickDrops}\n`;
+  body += `Auto-login Disabled (relogDisabled): ${extra.relogDisabled}\n`;
   body += `Room ID: ${state.roomId || "none"}\n`;
   body += `Searching: ${JSON.stringify(state.searching || [])}\n`;
   body += `Timer: ${state.timerOn ? "ON" : "OFF"}\n`;
   body += `Notice: ${state.notice || "none"}\n`;
   body += `Login Error: ${state.loginError || "none"}\n`;
   body += `Server Msg: ${state.serverMsg || "none"}\n`;
+  body += `IP Locked (proxy): ${state.ipLocked}\n`;
+  body += `IP Locked At: ${state.ipLockedAt ? new Date(state.ipLockedAt).toISOString() : "none"}\n`;
   body += `Upstream Cookie: ${state.upstreamCookie ? "present" : "none"}\n`;
   body += `</pre>`;
 

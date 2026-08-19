@@ -1,4 +1,6 @@
-import { DurableObject } from "cloudflare:workers";
+import WebSocket from "ws";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 import {
   splitFrame,
   parseLine,
@@ -8,6 +10,7 @@ import {
   parseDetails,
   spriteUrl,
   typeEffectiveness,
+  cleanRawHtml,
 } from "./protocol.js";
 import {
   renderHome,
@@ -19,8 +22,50 @@ import {
   renderDebug,
 } from "./html.js";
 
-const SHOWDOWN_WS_URL = "https://sim3.psim.us/showdown/websocket";
+const SHOWDOWN_WS_URL = "wss://sim3.psim.us/showdown/websocket";
 const ANIMATED_SPRITES = true;
+
+// ---------------------------------------------------------------------------
+// Outbound Proxy Configuration
+// ---------------------------------------------------------------------------
+// This MUST come from an environment variable, not a literal in source. This
+// file gets pushed to a public GitHub repo (see README setup steps), so
+// anything hardcoded here is public the moment it's committed. Set PROXY_URL
+// in Render's dashboard under the service's "Environment" tab instead, e.g.
+// http://user:pass@host:port
+const PROXY_URL = process.env.PROXY_URL;
+if (!PROXY_URL) {
+  throw new Error(
+    "PROXY_URL environment variable is not set. Set it in Render's " +
+      "dashboard (Environment tab) -- do not hardcode a proxy URL in source."
+  );
+}
+
+// Used for the persistent WebSocket connection to Showdown.
+const proxyAgent = new HttpsProxyAgent(PROXY_URL);
+
+// Used for the one HTTP call that also needs to go out through the proxy:
+// the login POST to action.php. (Previously only the WebSocket was proxied,
+// which meant the login handshake could still get flagged even when the
+// battle socket connected fine, since it went out on Render's un-proxied
+// IP.) Deliberately NOT applied globally to all fetch() calls -- the sprite
+// proxy and the pokedex/moves data pulls are plain public asset fetches
+// that don't need to eat into proxy bandwidth.
+function buildProxyDispatcher(proxyUrlStr) {
+  const u = new URL(proxyUrlStr);
+  const uri = `${u.protocol}//${u.host}`;
+  const opts = { uri };
+  if (u.username || u.password) {
+    const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+    opts.token = `Basic ${Buffer.from(creds).toString("base64")}`;
+  }
+  return new ProxyAgent(opts);
+}
+const proxyDispatcher = buildProxyDispatcher(PROXY_URL);
+
+const RECONNECT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];
+const QUICK_DROP_THRESHOLD_MS = 15000;
+const MAX_AUTO_RECONNECT_ATTEMPTS = 8;
 
 let pokedexCache = null;
 let pokedexPromise = null;
@@ -56,13 +101,6 @@ function sideKey(side) {
   return String(side || "").slice(0, 2);
 }
 
-function cleanMsg(s) {
-  return String(s || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 const DEFAULT_STATE = {
   connected: false,
   username: null,
@@ -91,39 +129,27 @@ const DEFAULT_STATE = {
   loginPassword: null,
   revealed: {},
   field: { weather: null, fields: [], sides: {} },
+  ipLocked: false,
+  ipLockedAt: null,
+  ipLockedMsg: null,
 };
 
-export class BattleSession extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.ctx = ctx;
-    this.env = env;
+export class BattleSession {
+  constructor(sid) {
+    this.sid = sid;
+    this.state_ = JSON.parse(JSON.stringify(DEFAULT_STATE));
     this.ws = null;
-    this.state_ = null;
     this.keepAliveInterval = null;
-    this.pendingAuth = null;
-    this.relogPromise = null;
     this.relogDisabled = false;
     this.freshChallstr = false;
     this.loginConfirmResolve = null;
-
-    this.ctx.blockConcurrencyWhile(async () => {
-      const saved = await this.ctx.storage.get("state");
-      this.state_ = { ...DEFAULT_STATE, ...(saved || {}) };
-      if (!this.state_.players) this.state_.players = {};
-      if (!this.state_.active) this.state_.active = {};
-      if (!this.state_.challengesFrom) this.state_.challengesFrom = {};
-      if (!Array.isArray(this.state_.chat)) this.state_.chat = [];
-      if (!Array.isArray(this.state_.log)) this.state_.log = [];
-      if (!this.state_.revealed) this.state_.revealed = {};
-      if (!this.state_.field) this.state_.field = { weather: null, fields: [], sides: {} };
-      if (!this.state_.field.fields) this.state_.field.fields = [];
-      if (!this.state_.field.sides) this.state_.field.sides = {};
-    });
-  }
-
-  async save() {
-    await this.ctx.storage.put("state", this.state_);
+    this.pendingLoginName = null;
+    this._loginLock = Promise.resolve();
+    this._connectLock = null;
+    this.connectedAt = null;
+    this.consecutiveQuickDrops = 0;
+    this._dropHandled = false;
+    this._messageQueue = Promise.resolve();
   }
 
   pushLog(line) {
@@ -283,38 +309,48 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  async readForm(request) {
-    const text = await request.text();
-    return new URLSearchParams(text);
-  }
-
   async waitForFreshChallstr(timeoutMs = 8000) {
     const start = Date.now();
     while (!this.freshChallstr || !this.state_.challstr) {
       if (Date.now() - start > timeoutMs) {
-        throw new Error("Timed out waiting for challenge string from Showdown.");
+        throw new Error("Timed out waiting for challenge token from Showdown.");
       }
       await new Promise((r) => setTimeout(r, 100));
     }
   }
 
+  enqueueLogin(fn) {
+    const run = this._loginLock.catch(() => {}).then(fn);
+    this._loginLock = run.catch(() => {});
+    return run;
+  }
+
   async login(username, password) {
+    return this.enqueueLogin(() => this._doLogin(username, password));
+  }
+
+  async _doLogin(username, password, isRetry = false) {
     this.state_.loginName = username;
     this.state_.loginPassword = password;
+    this.state_.username = username;
     this.state_.loginError = null;
 
     await this.waitForFreshChallstr(8000);
+
+    const usedWs = this.ws;
+    const usedChallstr = this.state_.challstr;
 
     const body = new URLSearchParams();
     body.set("act", "login");
     body.set("name", username);
     body.set("pass", password);
-    body.set("challstr", this.state_.challstr);
+    body.set("challstr", usedChallstr);
 
-    const res = await fetch("https://play.pokemonshowdown.com/action.php", {
+    const res = await undiciFetch("https://play.pokemonshowdown.com/action.php", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
+      dispatcher: proxyDispatcher,
     });
 
     const text = await res.text();
@@ -332,11 +368,24 @@ export class BattleSession extends DurableObject {
     const assertion =
       action?.assertion || data?.assertion || action?.data?.assertion || null;
 
-    if (!assertion) {
-      const errReason = action?.actionerror || data?.actionerror || "Login assertion rejected.";
-      this.state_.loginPassword = null;
+    if (!assertion || assertion.startsWith(";;")) {
+      const errReason = assertion
+        ? assertion.replace(/^;;/, "").trim()
+        : (action?.actionerror || data?.actionerror || "Login assertion rejected.");
+
+      if (/signature|token|expired/i.test(errReason)) {
+        this.freshChallstr = false;
+        this.state_.challstr = null;
+      }
       this.relogDisabled = true;
       throw new Error(errReason);
+    }
+
+    if (this.ws !== usedWs || this.state_.challstr !== usedChallstr) {
+      if (isRetry) {
+        throw new Error("Connection changed mid-login; please try again.");
+      }
+      return this._doLogin(username, password, true);
     }
 
     const finalName = action?.username || username;
@@ -347,15 +396,17 @@ export class BattleSession extends DurableObject {
       setTimeout(() => resolve(false), 8000);
     });
     this.loginConfirmResolve = confirmResolve;
+    this.pendingLoginName = finalName;
 
     this.send(`|/trn ${finalName},0,${assertion}`);
 
     const confirmed = await confirmPromise;
-    this.loginConfirmResolve = null;
+    if (this.loginConfirmResolve === confirmResolve) this.loginConfirmResolve = null;
+    this.pendingLoginName = null;
 
     if (!confirmed) {
       this.state_.loggedIn = false;
-      throw new Error("Showdown did not confirm authenticated state (remained as guest).");
+      throw new Error("Showdown did not confirm authenticated state.");
     }
 
     this.state_.username = finalName;
@@ -372,86 +423,96 @@ export class BattleSession extends DurableObject {
     const { loginName, loginPassword } = this.state_;
     if (!loginName || !loginPassword) return;
 
-    if (this.state_.loggedIn && this.ws && this.ws.readyState === 1 && this.state_.username?.toLowerCase() === loginName.toLowerCase()) {
-      return;
-    }
+    const alreadyIn = () =>
+      this.state_.loggedIn &&
+      this.ws &&
+      this.ws.readyState === 1 &&
+      this.state_.username?.toLowerCase() === loginName.toLowerCase();
 
-    if (!this.relogPromise) {
-      this.relogPromise = (async () => {
-        try {
-          const oldNotice = this.state_.notice;
-          await this.login(loginName, loginPassword);
-          this.pushLog(`(authenticated as ${loginName})`);
-          this.state_.notice = oldNotice;
-        } catch (err) {
-          this.pushLog(`(auto-login failed: ${err.message || err})`);
-          throw err;
-        } finally {
-          this.relogPromise = null;
-        }
-      })();
-    }
-    return this.relogPromise;
+    if (alreadyIn()) return;
+
+    return this.enqueueLogin(async () => {
+      if (alreadyIn()) return;
+      try {
+        const oldNotice = this.state_.notice;
+        await this._doLogin(loginName, loginPassword);
+        this.pushLog(`(authenticated as ${loginName})`);
+        this.state_.notice = oldNotice;
+      } catch (err) {
+        this.pushLog(`(auto-login failed: ${err.message || err})`);
+        throw err;
+      }
+    });
   }
 
   async ensureConnected() {
-    if (this.ws && this.ws.readyState === 1) {
-      return;
-    }
+    if (this.ws && this.ws.readyState === 1) return;
 
-    if (!this.state_.upstreamCookie) {
-      try {
-        const infoRes = await fetch("https://sim3.psim.us/showdown/info");
-        const sc = infoRes.headers.get("Set-Cookie");
-        if (sc) {
-          const match = sc.match(/(sid=[^;]+)/);
-          if (match) this.state_.upstreamCookie = match[1];
-        }
-      } catch {}
-    }
+    if (this._connectLock) return this._connectLock;
+    this._connectLock = this._doEnsureConnected().finally(() => {
+      this._connectLock = null;
+    });
+    return this._connectLock;
+  }
 
-    const headers = new Headers({ Upgrade: "websocket" });
-    if (this.state_.upstreamCookie) {
-      headers.set("Cookie", this.state_.upstreamCookie);
-    }
-    const resp = await fetch(SHOWDOWN_WS_URL, { headers });
-    const ws = resp.webSocket;
-    if (!ws) {
-      throw new Error("Showdown server did not accept WebSocket upgrade");
-    }
-    const setCookie = resp.headers.get("Set-Cookie");
-    if (setCookie) {
-      const match = setCookie.match(/(sid=[^;]+)/);
-      if (match) this.state_.upstreamCookie = match[1];
-    }
+  async _doEnsureConnected() {
+    if (this.ws && this.ws.readyState === 1) return;
 
-    ws.accept();
+    const ws = new WebSocket(SHOWDOWN_WS_URL, {
+      agent: proxyAgent,
+      headers: { "User-Agent": "ps-cloudphone" },
+    });
+
     this.ws = ws;
-
+    this.connectedAt = Date.now();
+    this._dropHandled = false;
     this.freshChallstr = false;
     this.state_.challstr = null;
-    this.state_.connected = true;
+    this.state_.connected = false;
     this.state_.loggedIn = false;
 
-    ws.addEventListener("message", (event) => {
-      this.ctx.waitUntil(this.onSocketMessage(event.data));
-    });
-    ws.addEventListener("close", (event) => {
-      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-      this.ctx.waitUntil(this.onSocketClose(event));
-    });
-    ws.addEventListener("error", () => {
-      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-      this.ctx.waitUntil(this.onSocketError());
+    ws.on("open", () => {
+      this.state_.connected = true;
+      if (this.state_.roomId && this.state_.roomId.startsWith("battle-")) {
+        try { ws.send(`${this.state_.roomId}|/join ${this.state_.roomId}`); } catch {}
+      }
+      if (this.state_.loginName && this.state_.loginPassword) {
+        this.autoRelogin().catch(() => {});
+      }
     });
 
-    if (this.state_.roomId && !this.state_.ended) {
-      try { ws.send(`${this.state_.roomId}|/join ${this.state_.roomId}`); } catch {}
-    }
+    ws.on("message", (data) => {
+      const text = data.toString();
+      const { roomId, lines } = splitFrame(text);
+      // handleLine is async (it awaits pokedex/moves lookups, etc). Chaining
+      // onto this._messageQueue instead of firing-and-forgetting each call
+      // guarantees lines are handled strictly in the order Showdown sent
+      // them, both within a frame and across separate "message" events --
+      // otherwise a later line (e.g. -damage) could get applied before an
+      // earlier one (e.g. switch) finishes its own awaits, corrupting state.
+      this._messageQueue = this._messageQueue
+        .then(async () => {
+          for (const rawLine of lines) {
+            await this.handleLine(roomId, rawLine);
+          }
+        })
+        .catch((err) => {
+          this.pushLog(`(error handling message: ${err.message || err})`);
+        });
+    });
 
-    if (this.state_.loginName && this.state_.loginPassword) {
-      this.pendingAuth = this.autoRelogin();
-    }
+    ws.on("close", (code, reason) => {
+      this.ws = null;
+      this.freshChallstr = false;
+      this.state_.connected = false;
+      this.state_.loggedIn = false;
+      this.pushLog(`(disconnected: ${reason || code})`);
+      this.noteDropAndMaybeReconnect();
+    });
+
+    ws.on("error", (err) => {
+      this.pushLog(`(socket error: ${err.message || err})`);
+    });
 
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
@@ -460,11 +521,15 @@ export class BattleSession extends DurableObject {
       } catch {}
     }, 45000);
 
-    await this.save();
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(), 8000);
+      ws.once("open", () => { clearTimeout(timer); resolve(); });
+      ws.once("error", (e) => { clearTimeout(timer); reject(e); });
+    }).catch(() => {});
   }
 
   send(text) {
-    if (!this.ws) throw new Error("Not connected");
+    if (!this.ws || this.ws.readyState !== 1) throw new Error("Not connected");
     this.ws.send(text);
   }
 
@@ -472,39 +537,59 @@ export class BattleSession extends DurableObject {
     this.send(`${roomId || ""}|${text}`);
   }
 
-  async onSocketMessage(message) {
-    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-    const { roomId, lines } = splitFrame(text);
-    for (const rawLine of lines) {
-      await this.handleLine(roomId, rawLine);
+  noteDropAndMaybeReconnect() {
+    if (this._dropHandled) return;
+    this._dropHandled = true;
+
+    const elapsed = this.connectedAt ? Date.now() - this.connectedAt : QUICK_DROP_THRESHOLD_MS;
+    this.connectedAt = null;
+
+    if (elapsed < 5000 && this.state_.loginName) {
+      this.relogDisabled = true;
+      this.pushLog(`(Showdown terminated session for ${this.state_.loginName}; pausing auto-login)`);
     }
-    await this.save();
-  }
 
-  async onSocketClose(event) {
-    this.ws = null;
-    this.freshChallstr = false;
-    this.state_.connected = false;
-    this.state_.loggedIn = false;
-    this.pushLog(`(disconnected: ${event.reason || event.code})`);
-    await this.save();
-  }
+    if (elapsed < QUICK_DROP_THRESHOLD_MS) {
+      this.consecutiveQuickDrops += 1;
+    } else {
+      this.consecutiveQuickDrops = 0;
+    }
 
-  async onSocketError() {
-    this.ws = null;
-    this.freshChallstr = false;
-    this.state_.connected = false;
-    this.state_.loggedIn = false;
-    this.pushLog(`(socket error)`);
-    await this.save();
+    if (this.consecutiveQuickDrops >= MAX_AUTO_RECONNECT_ATTEMPTS) {
+      this.pushLog(
+        `(connection dropped ${this.consecutiveQuickDrops} times in a row - pausing background reconnect; use /reconnect to retry)`
+      );
+      return;
+    }
+
+    const idx = Math.min(this.consecutiveQuickDrops - 1, RECONNECT_BACKOFF_MS.length - 1);
+    const delay = RECONNECT_BACKOFF_MS[Math.max(idx, 0)];
+    setTimeout(() => {
+      this.ensureConnected().catch((err) => {
+        this.pushLog(`(background reconnect failed: ${err.message || err})`);
+      });
+    }, delay);
   }
 
   async handleLine(roomId, rawLine) {
     const { type, parts } = parseLine(rawLine);
     const mySide = this.state_.mySide;
-    const inBattle = roomId === this.state_.roomId;
+    const inBattle = roomId && roomId === this.state_.roomId && roomId.startsWith("battle-");
+
+    if (roomId && roomId.startsWith("help-")) {
+      try { this.sendToRoom(roomId, "/leave"); } catch {}
+    }
 
     switch (type) {
+      case "html":
+      case "raw": {
+        const text = cleanRawHtml(parts.join("|"));
+        if (text && inBattle) {
+          this.pushChat(`[info] ${text}`);
+        }
+        break;
+      }
+
       case "challstr": {
         this.state_.challstr = parts.join("|");
         this.freshChallstr = true;
@@ -516,10 +601,20 @@ export class BattleSession extends DurableObject {
         const rawName = parts[0] || "";
         const name = rawName.trim().replace(/^[^A-Za-z0-9]+/, "");
         const named = parts[1] === "1" || parts[1] === 1 || (!/^guest/i.test(name) && name.length > 0 && parts[1] !== "0");
-        this.state_.username = name;
-        this.state_.loggedIn = named;
 
-        if (this.loginConfirmResolve && named) {
+        if (named) {
+          this.state_.username = name;
+          this.state_.loggedIn = true;
+        } else if (!this.state_.loginName) {
+          this.state_.username = name;
+          this.state_.loggedIn = false;
+        }
+
+        if (
+          this.loginConfirmResolve &&
+          named &&
+          (!this.pendingLoginName || normalizeName(name) === normalizeName(this.pendingLoginName))
+        ) {
           const res = this.loginConfirmResolve;
           this.loginConfirmResolve = null;
           res(true);
@@ -541,14 +636,32 @@ export class BattleSession extends DurableObject {
         break;
       }
 
+      case "noinit":
+      case "deinit": {
+        if (roomId === this.state_.roomId || (this.state_.roomId && !this.state_.roomId.startsWith("battle-"))) {
+          this.resetBattle();
+        }
+        break;
+      }
+
       case "popup":
       case "message":
       case "error":
       case "warning": {
-        const msg = cleanMsg(parts.join("|"));
+        const msg = cleanRawHtml(parts.join("|"));
         if (msg) {
           this.state_.serverMsg = msg;
           this.pushLog(`[server] ${msg}`);
+          if (this.loginConfirmResolve && /signature|assertion|authentication|token/i.test(msg)) {
+            const res = this.loginConfirmResolve;
+            this.loginConfirmResolve = null;
+            res(false);
+          }
+          if (/locked due to being a proxy/i.test(msg)) {
+            this.state_.ipLocked = true;
+            this.state_.ipLockedAt = Date.now();
+            this.state_.ipLockedMsg = msg;
+          }
         }
         break;
       }
@@ -566,14 +679,15 @@ export class BattleSession extends DurableObject {
           const json = JSON.parse(parts[0]);
           this.state_.searching = json.searching || [];
           if (json.games) {
-            const ids = Object.keys(json.games);
-            if (ids.length > 0) {
-              const gid = ids[0];
+            const battleIds = Object.keys(json.games).filter((id) => id.startsWith("battle-"));
+            if (battleIds.length > 0) {
+              const gid = battleIds[0];
               if (gid !== this.state_.roomId) {
                 this.resetBattle();
                 this.state_.roomId = gid;
                 this.state_.roomTitle = json.games[gid] || gid;
                 this.sendToRoom(gid, "/join " + gid);
+                this.state_.ipLocked = false;
               }
             } else if (this.state_.roomId && !this.state_.ended) {
               this.state_.ended = true;
@@ -609,9 +723,7 @@ export class BattleSession extends DurableObject {
             this.state_.request = null;
             break;
           }
-          const side = String(
-            req?.side?.id || req?.side?.pokemon?.[0]?.ident || ""
-          ).slice(0, 2);
+          const side = String(req?.side?.id || req?.side?.pokemon?.[0]?.ident || "").slice(0, 2);
           if (side === "p1" || side === "p2") this.state_.mySide = side;
 
           const dex = await getPokedex();
@@ -623,16 +735,18 @@ export class BattleSession extends DurableObject {
               const id = normalizeName(species);
               if (dex[id] && dex[id].types) p.types = dex[id].types;
               if (Array.isArray(p.moves)) {
-                p.moveTypes = [...new Set(
-                  p.moves
-                    .map((mId) => {
-                      const d = movesData[mId];
-                      if (!d || d.category === "Status") return null;
-                      if (!(Number(d.basePower) > 0)) return null;
-                      return d.type || null;
-                    })
-                    .filter(Boolean)
-                )];
+                p.moveTypes = [
+                  ...new Set(
+                    p.moves
+                      .map((mId) => {
+                        const d = movesData[mId];
+                        if (!d || d.category === "Status") return null;
+                        if (!(Number(d.basePower) > 0)) return null;
+                        return d.type || null;
+                      })
+                      .filter(Boolean)
+                  ),
+                ];
               }
             }
           }
@@ -688,8 +802,7 @@ export class BattleSession extends DurableObject {
           if (mon && mv) {
             mon.usedMoves = mon.usedMoves || [];
             if (!mon.usedMoves.includes(mv)) mon.usedMoves.push(mv);
-            const entry =
-              this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
+            const entry = this.state_.revealed[sideKey(p.side)]?.[normalizeName(mon.species)];
             if (entry) {
               entry.usedMoves = entry.usedMoves || [];
               if (!entry.usedMoves.includes(mv)) entry.usedMoves.push(mv);
@@ -852,7 +965,7 @@ export class BattleSession extends DurableObject {
             }
             if (entry.baseStats && Number.isFinite(entry.baseStats.spe) && mon.level) {
               mon.predictedSpeed =
-                Math.floor(((2 * entry.baseStats.spe + 85) * level) / 100) + 5;
+                Math.floor(((2 * entry.baseStats.spe + 85) * mon.level) / 100) + 5;
             }
             mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
             mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
@@ -1001,22 +1114,15 @@ export class BattleSession extends DurableObject {
     }
   }
 
-  htmlResponse(body) {
-    return new Response(body, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-      },
-    });
-  }
-
-  async fetch(request) {
+  async handleRequest(req, res) {
     try {
       await this.ensureConnected();
-      const url = new URL(request.url);
 
-      if (url.pathname === "/search") {
-        if (this.state_.ended || !this.state_.roomId) {
+      const path = req.path;
+
+      if (path === "/search") {
+        if (this.state_.roomId) {
+          try { this.sendToRoom(this.state_.roomId, "/leave"); } catch {}
           this.resetBattle();
         }
 
@@ -1025,62 +1131,59 @@ export class BattleSession extends DurableObject {
             await this.autoRelogin();
           } catch (err) {
             this.state_.notice = `Search blocked: Authentication failed (${err.message}).`;
-            await this.save();
-            return Response.redirect(new URL("/debug", url), 302);
+            return res.redirect("/debug");
           }
         }
 
-        const format = url.searchParams.get("format") || "gen9randombattle";
-        
+        const format = req.query.format || "gen9randombattle";
         if (this.state_.searching.length > 0) {
           try { this.send(`|/cancelsearch`); } catch {}
         }
-        
+
         this.send(`|/utm null`);
         this.send(`|/search ${format}`);
-        
+
         const hadBattle = !!(this.state_.roomId && !this.state_.ended);
-        const deadline = Date.now() + 5000;
+        const deadline = Date.now() + 6000;
         let ok = false;
         let instantMatch = false;
 
         while (Date.now() < deadline) {
           if ((this.state_.searching || []).includes(format)) { ok = true; break; }
-          if (!hadBattle && this.state_.roomId && !this.state_.ended) { 
-             ok = true; 
-             instantMatch = true; 
-             break; 
+          if (!hadBattle && this.state_.roomId && !this.state_.ended) {
+            ok = true;
+            instantMatch = true;
+            break;
           }
           await new Promise((r) => setTimeout(r, 200));
         }
-        
+
         if (instantMatch) {
           this.state_.notice = null;
-          await this.save();
-          return Response.redirect(new URL("/battle", url), 302);
+          return res.redirect("/battle");
         }
-        
-        if (ok) {
-          this.state_.notice = `Searching for ${format}...`;
-        } else {
-          this.state_.notice = `Search did not start on Showdown server. Check /debug.`;
-        }
-        await this.save();
-        return Response.redirect(new URL("/", url), 302);
+
+        this.state_.notice = ok
+          ? `Searching for ${format}...`
+          : `Searching for ${format}... (check back shortly)`;
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/cancelsearch") {
-        this.send(`|/cancelsearch`);
+      if (path === "/cancelsearch") {
+        try { this.send(`|/cancelsearch`); } catch {}
         this.state_.searching = [];
-        await this.save();
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/challenge") {
-        if (request.method === "POST") {
-          const params = await this.readForm(request);
-          const target = (params.get("username") || "").trim();
-          const format = params.get("format") || "gen9randombattle";
+      if (path === "/dismiss") {
+        this.state_.serverMsg = null;
+        return res.redirect(req.query.from || "/");
+      }
+
+      if (path === "/challenge") {
+        if (req.method === "POST") {
+          const target = (req.body.username || "").trim();
+          const format = req.body.format || "gen9randombattle";
           if (target) {
             if (this.state_.loginName) {
               await this.autoRelogin();
@@ -1088,22 +1191,21 @@ export class BattleSession extends DurableObject {
             this.send(`|/utm null`);
             this.send(`|/challenge ${target}, ${format}`);
             this.state_.notice = `Challenge sent to ${target}.`;
-            await this.save();
           }
         }
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/cancelchallenge") {
+      if (path === "/cancelchallenge") {
         const to = this.state_.challengeTo && this.state_.challengeTo.to;
         if (to) {
           try { this.send(`|/cancelchallenge ${to}`); } catch {}
         }
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/accept") {
-        const user = url.searchParams.get("user");
+      if (path === "/accept") {
+        const user = req.query.user;
         if (user) {
           if (this.state_.loginName) {
             await this.autoRelogin();
@@ -1111,25 +1213,27 @@ export class BattleSession extends DurableObject {
           this.send(`|/utm null`);
           this.send(`|/accept ${user}`);
         }
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/reject") {
-        const user = url.searchParams.get("user");
+      if (path === "/reject") {
+        const user = req.query.user;
         if (user) {
           try { this.send(`|/reject ${user}`); } catch {}
         }
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/newgame") {
+      if (path === "/newgame") {
+        if (this.state_.roomId) {
+          try { this.sendToRoom(this.state_.roomId, "/leave"); } catch {}
+        }
         this.resetBattle();
-        await this.save();
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/choose") {
-        const value = url.searchParams.get("value");
+      if (path === "/choose") {
+        const value = req.query.value;
         if (value && this.state_.roomId && this.state_.request) {
           const rqid = this.state_.request.rqid;
           this.sendToRoom(
@@ -1137,110 +1241,113 @@ export class BattleSession extends DurableObject {
             `/choose ${value}${rqid !== undefined ? "|" + rqid : ""}`
           );
           this.state_.request = null;
-          await this.save();
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return res.redirect("/battle");
       }
 
-      if (url.pathname === "/lead") {
-        const idx = Number(url.searchParams.get("i") || 0) - 1;
-        const req = this.state_.request;
-        if (req?.teamPreview && this.state_.roomId) {
-          const size = req.side?.pokemon?.length || 6;
+      if (path === "/lead") {
+        const idx = Number(req.query.i || 0) - 1;
+        const reqData = this.state_.request;
+        if (reqData?.teamPreview && this.state_.roomId) {
+          const size = reqData.side?.pokemon?.length || 6;
           const nums = Array.from({ length: size }, (_, i) => i + 1);
           if (idx >= 0 && idx < size) {
             const lead = idx + 1;
             const order = [lead, ...nums.filter((n) => n !== lead)].join("");
             this.sendToRoom(
               this.state_.roomId,
-              `/choose team ${order}|${req.rqid || ""}`
+              `/choose team ${order}|${reqData.rqid || ""}`
             );
             this.state_.request = null;
-            await this.save();
           }
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return res.redirect("/battle");
       }
 
-      if (url.pathname === "/chat") {
-        if (request.method === "POST" && this.state_.roomId && !this.state_.ended) {
-          const params = await this.readForm(request);
-          const msg = (params.get("msg") || "").trim().slice(0, 300);
-          if (msg && !msg.startsWith("/")) {
+      if (path === "/chat") {
+        if (req.method === "POST" && this.state_.roomId && !this.state_.ended) {
+          const msg = (req.body.msg || "").trim().slice(0, 300);
+          if (msg) {
             try { this.sendToRoom(this.state_.roomId, msg); } catch {}
           }
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return res.redirect("/battle");
       }
 
-      if (url.pathname === "/moveinfo") {
-        const moveId = url.searchParams.get("move") || "";
+      if (path === "/moveinfo") {
+        const moveId = req.query.move || "";
         const movesData = await getMoves();
-        return this.htmlResponse(
-          renderMoveInfo(movesData[moveId] || null, moveId, this.state_)
-        );
+        return res.send(renderMoveInfo(movesData[moveId] || null, moveId, this.state_));
       }
 
-      if (url.pathname === "/dex") {
-        const q = url.searchParams.get("q") || "";
+      if (path === "/dex") {
+        const q = req.query.q || "";
         const dex = await getPokedex();
         const id = normalizeName(q);
         const entry = id ? dex[id] : null;
-        return this.htmlResponse(renderDex(entry, q));
+        return res.send(renderDex(entry, q));
       }
 
-      if (url.pathname === "/debug") {
+      if (path === "/debug") {
         const extra = {
           wsOpen: Boolean(this.ws && this.ws.readyState === 1),
           wsState: this.ws ? this.ws.readyState : "NULL",
           freshChallstr: this.freshChallstr,
+          connectingNow: Boolean(this._connectLock),
+          pendingLoginName: this.pendingLoginName || "none",
+          consecutiveQuickDrops: this.consecutiveQuickDrops,
+          relogDisabled: this.relogDisabled,
         };
-        return this.htmlResponse(renderDebug(this.state_, extra));
+        return res.send(renderDebug(this.state_, extra));
       }
 
-      if (url.pathname === "/timer") {
+      if (path === "/timer") {
         if (this.state_.roomId && !this.state_.ended) {
           const cmd = this.state_.timerOn ? "/timer off" : "/timer on";
           try { this.sendToRoom(this.state_.roomId, cmd); } catch {}
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return res.redirect("/battle");
       }
 
-      if (url.pathname === "/forfeit") {
+      if (path === "/forfeit") {
         if (this.state_.roomId && !this.state_.ended) {
           try { this.sendToRoom(this.state_.roomId, "/forfeit"); } catch {}
         }
-        return Response.redirect(new URL("/battle", url), 302);
+        return res.redirect("/battle");
       }
 
-      if (url.pathname === "/reconnect") {
+      if (path === "/reconnect") {
         try { this.ws?.close(); } catch {}
         this.ws = null;
         this.freshChallstr = false;
         this.state_.connected = false;
         this.state_.loggedIn = false;
-        await this.save();
+        this.state_.ipLocked = false;
+        this.state_.ipLockedAt = null;
+        this.relogDisabled = false;
+        this.consecutiveQuickDrops = 0;
+        this.connectedAt = null;
+        this._dropHandled = false;
         await this.ensureConnected();
-        return Response.redirect(new URL("/debug", url), 302);
+        return res.redirect("/debug");
       }
 
-      if (url.pathname === "/login") {
-        if (request.method === "POST") {
-          const params = await this.readForm(request);
-          const username = (params.get("username") || "").trim();
-          const password = params.get("password") || "";
+      if (path === "/login") {
+        if (req.method === "POST") {
+          const username = (req.body.username || "").trim();
+          const password = req.body.password || "";
           try {
+            this.relogDisabled = false;
             await this.login(username, password);
           } catch (err) {
             this.state_.loginError = err.message || String(err);
           }
-          await this.save();
-          return Response.redirect(new URL("/", url), 302);
+          return res.redirect("/");
         }
-        return this.htmlResponse(renderLogin(this.state_));
+        return res.send(renderLogin(this.state_));
       }
 
-      if (url.pathname === "/logout") {
+      if (path === "/logout") {
         try { this.send("|/logout"); } catch {}
         try { this.ws?.close(); } catch {}
         this.ws = null;
@@ -1252,28 +1359,19 @@ export class BattleSession extends DurableObject {
         this.state_.connected = false;
         this.relogDisabled = false;
         this.state_.notice = "Logged out.";
-        await this.save();
-        return Response.redirect(new URL("/", url), 302);
+        return res.redirect("/");
       }
 
-      if (url.pathname === "/battle") {
-        if (!this.state_.roomId) {
-          return Response.redirect(new URL("/", url), 302);
-        }
-        return this.htmlResponse(renderBattle(this.state_));
+      if (path === "/battle") {
+        if (!this.state_.roomId) return res.redirect("/");
+        return res.send(renderBattle(this.state_));
       }
 
       const homeHtml = renderHome(this.state_);
-      if (this.state_.notice) {
-        this.state_.notice = null;
-        await this.save();
-      }
-      return this.htmlResponse(homeHtml);
+      if (this.state_.notice) this.state_.notice = null;
+      return res.send(homeHtml);
     } catch (err) {
-      return new Response(renderError(err.message || String(err)), {
-        status: 500,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return res.status(500).send(renderError(err.message || String(err)));
     }
   }
 }

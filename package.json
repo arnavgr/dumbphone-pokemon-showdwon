@@ -1,13 +1,19 @@
 {
   "name": "ps-cloudphone",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+  "engines": {
+    "node": ">=18.17.0"
   },
-  "devDependencies": {
-    "wrangler": "^4.0.0"
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.4",
+    "undici": "^6.19.8",
+    "ws": "^8.16.0"
   }
 }
