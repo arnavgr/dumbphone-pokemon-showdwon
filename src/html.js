@@ -1,4 +1,4 @@
-import { spriteUrl, typeEffectiveness } from "./protocol.js";
+import { spriteUrl, typeEffectiveness, typeChartTable } from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
@@ -36,10 +36,12 @@ h1{font-size:18px;margin:4px 0}
 h2{font-size:15px;margin:12px 0 4px}
 .muted{color:#999;font-size:12px}
 .chip{display:inline-block;border:1px solid #555;border-radius:4px;padding:0 4px;margin:0 4px 2px 0;font-size:12px}
+code{background:#222;padding:1px 4px;border-radius:3px;font-size:13px}
 .hpbar{font-weight:bold}
 a.row{display:block;border:1px solid #444;border-radius:6px;padding:6px;margin:6px 0;text-decoration:none;background:#1c1c22;color:#eee}
 a.row img{display:block;margin:0 auto 4px}
 .log{font-size:13px;border:1px solid #333;border-radius:6px;padding:6px}
+.banner{background:#2a2510;border:1px solid #775500;padding:6px;border-radius:4px;margin:6px 0;font-size:12px}
 input[type=text],input[type=password],select{font-size:16px;width:92%}
 input[type=submit]{font-size:16px}
 form{margin:6px 0}
@@ -190,7 +192,11 @@ function renderRevealed(state) {
     const isActive =
       oppActive && e.species === oppActive.species && oppActive.condition !== "0 fnt";
     const tags = [e.ability, e.item].filter(Boolean).join(" / ");
-    body += `<div>- ${esc(e.species)}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
+    const typesChip =
+      e.types && e.types.length
+        ? ` <span class="chip">${esc(e.types.join("/"))}${e.teraType ? " Tera" : ""}</span>`
+        : "";
+    body += `<div>- ${esc(e.species)}${typesChip}${e.level && e.level !== 100 ? ` L${e.level}` : ""}${
       isActive ? " <strong>(active)</strong>" : ""
     } - ${hpBar(e.condition) || "-"}${
       tags ? ` <span class="muted">[${esc(tags)}]</span>` : ""
@@ -245,7 +251,7 @@ function renderTypeMatchup(state) {
 
       const myTypes = p.types || [];
       const weakTo = [];
-      const strongAgainst = [];
+      const resists = [];
       const immuneTo = [];
 
       if (myTypes.length) {
@@ -253,14 +259,14 @@ function renderTypeMatchup(state) {
           const defEff = typeEffectiveness(oppType, myTypes);
           if (defEff > 1) weakTo.push(oppType.toLowerCase());
           else if (defEff === 0) immuneTo.push(oppType.toLowerCase());
-          else if (defEff < 1) strongAgainst.push(oppType.toLowerCase());
+          else if (defEff < 1) resists.push(oppType.toLowerCase());
         }
       }
 
       const defParts = [];
+      if (weakTo.length) defParts.push(`weak to ${weakTo.join("/")}`);
+      if (resists.length) defParts.push(`resists ${resists.join("/")}`);
       if (immuneTo.length) defParts.push(`immune to ${immuneTo.join("/")}`);
-      if (weakTo.length) defParts.push(`weak against ${weakTo.join("/")}`);
-      if (strongAgainst.length) defParts.push(`strong against ${strongAgainst.join("/")}`);
 
       const defLabel = defParts.length ? `, ${defParts.join(", ")}` : "";
 
@@ -307,10 +313,19 @@ function renderMoveDesc(m) {
   return `<div class="muted">${esc(text)}${moreLink}</div>`;
 }
 
+function movesLine(moveDetails) {
+  if (!moveDetails || !moveDetails.length) return "";
+  const text = moveDetails
+    .map((m) => `${m.name}${m.type ? ` [${m.type}]` : ""}`)
+    .join(", ");
+  return `<br><span class="muted">Moves: ${esc(text)}</span>`;
+}
+
 function switchCard(p, i, href, showNum) {
   const species = (p.details || "").split(",")[0];
   const imgUrl = spriteUrl(species, { anim: false });
   const typesText = p.types && p.types.length ? ` [${esc(p.types.join("/"))}]` : "";
+  const teraText = p.teraType ? ` <span class="chip">Tera: ${esc(p.teraType)}</span>` : "";
   const stats = statsLine(p.stats);
   const cond = p.condition ? ` ${hpBar(p.condition)}` : "";
   const bits = [];
@@ -319,9 +334,9 @@ function switchCard(p, i, href, showNum) {
   const extra = bits.length ? `<br><span class="muted">${esc(bits.join(" | "))}</span>` : "";
   return `<a class="row" href="${esc(href)}">
 <img src="${esc(imgUrl)}" alt="" width="96">
-<span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${
+<span>${showNum ? `${i + 1}. ` : ""}<strong>${esc(species)}</strong>${cond}${typesText}${teraText}${
     stats ? `<br><span class="muted">Atk/Def/SpA/SpD/Spe: ${esc(stats)}</span>` : ""
-  }${extra}</span>
+  }${extra}${movesLine(p.moveDetails)}</span>
 </a>`;
 }
 
@@ -376,6 +391,21 @@ function renderChallenges(state) {
   return body;
 }
 
+function renderIpLockBanner(state) {
+  if (!state.ipLocked) return "";
+  const since = state.ipLockedAt
+    ? Math.max(0, Math.round((Date.now() - state.ipLockedAt) / 1000))
+    : null;
+  return `<div class="banner" style="background:#2a1010;border-color:#772222">
+<strong>Connection flagged as a proxy by Showdown</strong>
+<div>${esc(state.ipLockedMsg || "Showdown is treating this connection as a proxy and may close it.")}</div>
+<div class="muted">This is Cloudflare's shared IP range being flagged, not your account specifically. The app reconnects itself in the background with a growing delay if the connection keeps dropping quickly, and gives up on retrying automatically after a while rather than repeatedly hitting a connection that's been flagged${
+    since !== null ? ` (first seen ${since}s ago)` : ""
+  }. Loading any page, or the link below, always tries again immediately.</div>
+<div><a href="/reconnect">Retry connection now</a></div>
+</div>`;
+}
+
 export function renderHome(state) {
   let body = `<h1>PS CloudPhone</h1>`;
 
@@ -383,10 +413,16 @@ export function renderHome(state) {
     state.connected ? `Connected as ${esc(state.username || "guest")}` : "Not connected yet."
   }${state.loggedIn ? " (logged in)" : ""}</div>`;
 
-  if (state.notice) body += `<p>${esc(state.notice)}</p>`;
-  if (state.loginError) body += `<p>Login error: ${esc(state.loginError)}</p>`;
+  body += renderIpLockBanner(state);
 
-  body += `<p><a href="/">Refresh</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
+  if (state.serverMsg && !state.ipLocked) {
+    body += `<div class="banner"><strong>Notice:</strong> ${esc(state.serverMsg)}<br><a href="/dismiss?from=/">[OK / Dismiss]</a></div>`;
+  }
+
+  if (state.notice) body += `<p>${esc(state.notice)}</p>`;
+  if (state.loginError) body += `<p style="color:#b22">Login error: ${esc(state.loginError)}</p>`;
+
+  body += `<p><a href="/">Refresh</a> | <a href="/typechart">Type Chart</a> | <a href="/commands">Commands</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -417,16 +453,16 @@ export function renderHome(state) {
     (state.searching && state.searching.length > 0) ||
     Boolean(state.challengeTo && state.challengeTo.to);
 
-  return page("PS CloudPhone", body, shouldAutoRefresh ? 8 : 0);
+  return page("PS CloudPhone", body, shouldAutoRefresh ? 6 : 0);
 }
 
 export function renderLogin(state) {
   let body = `<h1>Login</h1>`;
 
-  if (state.loginError) body += `<p>${esc(state.loginError)}</p>`;
+  if (state.loginError) body += `<p style="color:#b22">${esc(state.loginError)}</p>`;
 
   body += `<form method="post" action="/login">
-<div><label>Username<br><input type="text" name="username"></label></div>
+<div><label>Username<br><input type="text" name="username" value="${esc(state.loginName || "")}"></label></div>
 <div><label>Password<br><input type="password" name="password"></label></div>
 <p class="muted">Warning: this worker stores your password so it can silently re-login after reconnects. Use only on your own personal deployment.</p>
 <div><input type="submit" value="Login"></div>
@@ -441,6 +477,12 @@ export function renderBattle(state) {
   body += `<div>Turn ${state.turn || 0}${state.ended ? " - battle over" : ""}</div>`;
   body += `<div>Timer: <strong>${state.timerOn ? "ON" : "OFF"}</strong></div>`;
 
+  body += renderIpLockBanner(state);
+
+  if (state.serverMsg && !state.ipLocked) {
+    body += `<div class="banner"><strong>Notice:</strong> ${esc(state.serverMsg)}<br><a href="/dismiss?from=/battle">[OK / Dismiss]</a></div>`;
+  }
+
   if (!state.mySide) body += `<div class="muted">Detecting your side...</div>`;
 
   body += `<h2>You</h2>`;
@@ -451,6 +493,7 @@ export function renderBattle(state) {
   body += renderRevealed(state);
   body += renderField(state);
   body += renderTypeMatchup(state);
+  body += `<p class="muted"><a href="/typechart">See full type chart</a></p>`;
 
   body += `<h2>Log</h2>${renderLog(state.log)}`;
   body += renderChat(state);
@@ -539,7 +582,7 @@ export function renderBattle(state) {
 
   body += `<p><a href="/battle">Refresh</a> | <a href="/timer">${
     state.timerOn ? "Turn timer off" : "Turn timer on"
-  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
+  }</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/commands">Commands</a> | <a href="/debug">Debug</a> | <a href="/forfeit">Forfeit</a> | <a href="/">Home</a></p>`;
 
   const refresh = state.request ? 0 : 7;
 
@@ -571,7 +614,7 @@ export function renderMoveInfo(move, moveId, state) {
   if (oppTypes && oppTypes.length) {
     const oppLabel = oppInfo.species || oppInfo.nickname || "the opponent";
     if (move.category === "Status") {
-      body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: status move - type effectiveness doesn't apply.</p>`;
+      body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}] status move - type effectiveness doesn't apply.</p>`;
     } else {
       const mult = typeEffectiveness(move.type, oppTypes);
       body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: <strong>${esc(
@@ -618,11 +661,125 @@ export function renderDex(entry, q) {
   return page(entry ? `Pok&eacute;dex: ${entry.name}` : "Pok&eacute;dex", body);
 }
 
+const BATTLE_COMMANDS = [
+  ["/dt [Pokemon, Move, Item, or Ability]", "Full data on the thing: base stats, typing, abilities, or for a move its power/accuracy/effect."],
+  ["/weakness [type or Pokemon]", "All the type matchups against a type (or a Pokemon's typing)."],
+  ["/coverage [type]", "All the type matchups for a type - what it hits well."],
+  ["/effectiveness [move], [Pokemon or type]", "Effectiveness of one specific move against one specific target."],
+  ["/calc", "Link to the Showdown damage calculator."],
+  ["/statcalc [level] [base stat] [IVs] [nature] [EVs] [modifier]", "Works out a Pokemon's actual stat from those inputs."],
+  ["/savereplay", "Saves a shareable replay link for the battle you're in."],
+  ["/modjoin +", "Makes the battle private/spectator-restricted - good if someone's spamming."],
+  ["/roomvoice [player]", "Lets a specific person join and talk even with /modjoin + on."],
+  ["/hideroom", "Hides the battle from the public battle list. Still reachable by direct link."],
+  ["/ionext", "Auto-applies /modjoin + to your next battle. Useful if someone's trying to snipe you."],
+];
+
+const TEAMBUILDING_COMMANDS = [
+  ["/ds [criteria], [criteria]", "(/dexsearch) Finds Pokemon matching criteria like type, ability, or stats. Use /help ds for the full list."],
+  ["/ms [criteria], [criteria]", "(/movesearch) Finds moves matching criteria. Use /help ms for the full list."],
+  ["/is [keyword]", "(/itemsearch) Finds items matching a keyword - handy for finding all berries of a type."],
+  ["/analysis [Pokemon]", "Link to that Pokemon's Smogon analysis page with common sets - great for beginners."],
+  ["/learn [Pokemon], [move]", "Checks whether a Pokemon can learn a given move."],
+  ["/randompokemon [number], [criteria]", "Generates random Pokemon matching criteria."],
+  ["/randommove [criteria]", "Generates a random move matching criteria."],
+];
+
+const OTHER_USEFUL_COMMANDS = [
+  ["/rating [username]", "(or /rank) Shows a player's ladder rating."],
+  ["/nick [new name]", "Changes your display name (resets your rating, keeps your old name's history)."],
+  ["/whois [username]", "Basic info about a user."],
+];
+
+function commandTable(rows) {
+  return rows
+    .map(
+      ([cmd, desc]) =>
+        `<div><code>${esc(cmd)}</code><div class="muted">${esc(desc)}</div></div>`
+    )
+    .join("<hr>");
+}
+
+export function renderCommands() {
+  let body = `<h1>Commands</h1>`;
+  body += `<p class="muted">These are Showdown's own chat commands, not app features - type them straight into the chat box during a battle and the reply shows up in your chat log. Data/teambuilding commands (like /dt or /learn) also work fine outside a battle on the real Showdown site, but this app's chat box is currently only available while you're in a battle room.</p>`;
+
+  body += `<h2>Battle commands</h2>`;
+  body += commandTable(BATTLE_COMMANDS);
+
+  body += `<h2>Teambuilding &amp; info commands</h2>`;
+  body += commandTable(TEAMBUILDING_COMMANDS);
+
+  body += `<h2>Other useful commands</h2>`;
+  body += commandTable(OTHER_USEFUL_COMMANDS);
+
+  body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
+  return page("Commands", body);
+}
+
+export function renderTypeChart() {
+  const rows = typeChartTable();
+
+  let body = `<h1>Type Chart</h1>`;
+  body += `<p class="muted">For each type, what's super effective against it, what it resists, and what can't touch it at all. This is per single type - for a dual-type Pok&eacute;mon, combine both of its type's rows (a move that's on both lists, e.g. weak on one and resisted on the other, cancels out to neutral).</p>`;
+
+  for (const r of rows) {
+    body += `<h2>${esc(r.type)}</h2>`;
+    body += `<div>Weak to (2x or more): ${
+      r.weakTo.length ? r.weakTo.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+    body += `<div>Resists (0.5x): ${
+      r.resists.length ? r.resists.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+    body += `<div>Immune to (0x): ${
+      r.immuneTo.length ? r.immuneTo.map(esc).join(", ") : "<span class=\"muted\">none</span>"
+    }</div>`;
+  }
+
+  body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
+  return page("Type Chart", body);
+}
+
+export function renderDebug(state, extra) {
+  let body = `<h1>System Debug</h1>`;
+  body += `<p><a href="/">Home</a> | <a href="/reconnect">Force Reconnect</a> | <a href="/debug">Refresh Debug</a></p>`;
+  body += `<h2>State Overview</h2>`;
+  body += `<pre style="background:#222;padding:6px;border-radius:4px;font-size:12px;overflow-x:auto;">`;
+  body += `WebSocket Open: ${extra.wsOpen}\n`;
+  body += `WS readyState: ${extra.wsState}\n`;
+  body += `Connected: ${state.connected}\n`;
+  body += `Username: ${state.username || "none"}\n`;
+  body += `Logged In (named=1): ${state.loggedIn}\n`;
+  body += `Saved Account: ${state.loginName || "none"}\n`;
+  body += `Fresh Challstr: ${extra.freshChallstr}\n`;
+  body += `Connecting Now: ${extra.connectingNow}\n`;
+  body += `Pending Login Confirm: ${extra.pendingLoginName}\n`;
+  body += `Consecutive Quick Drops: ${extra.consecutiveQuickDrops}\n`;
+  body += `Auto-login Disabled (relogDisabled): ${extra.relogDisabled}\n`;
+  body += `Room ID: ${state.roomId || "none"}\n`;
+  body += `Searching: ${JSON.stringify(state.searching || [])}\n`;
+  body += `Timer: ${state.timerOn ? "ON" : "OFF"}\n`;
+  body += `Notice: ${state.notice || "none"}\n`;
+  body += `Login Error: ${state.loginError || "none"}\n`;
+  body += `Server Msg: ${state.serverMsg || "none"}\n`;
+  body += `IP Locked (proxy): ${state.ipLocked}\n`;
+  body += `IP Locked At: ${state.ipLockedAt ? new Date(state.ipLockedAt).toISOString() : "none"}\n`;
+  body += `Upstream Cookie: ${state.upstreamCookie ? "present" : "none"}\n`;
+  body += `</pre>`;
+
+  body += `<h2>System & Combat Logs (Last 50)</h2>`;
+  const recentLogs = (state.log || []).slice(-50);
+  body += `<div class="log">${recentLogs.map((l) => `<div>${esc(l)}</div>`).join("") || '<div class="muted">(no logs)</div>'}</div>`;
+
+  body += `<p><a href="/">Back to Home</a></p>`;
+  return page("System Debug", body);
+}
+
 export function renderError(message) {
   return page(
     "Error",
     `<h1>Error</h1>
 <p>${esc(message)}</p>
-<p><a href="/">Home</a></p>`
+<p><a href="/debug">View Debug Logs</a> | <a href="/">Home</a></p>`
   );
 }

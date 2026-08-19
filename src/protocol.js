@@ -111,8 +111,43 @@ export function typeEffectiveness(moveType, defenderTypes) {
   return mult;
 }
 
+export const ALL_TYPES = Object.keys(TYPE_CHART);
+
+export function typeChartTable() {
+  return ALL_TYPES.map((defType) => {
+    const weakTo = [];
+    const resists = [];
+    const immuneTo = [];
+    for (const atkType of ALL_TYPES) {
+      const chart = TYPE_CHART[atkType];
+      const mult = chart && chart[defType] !== undefined ? chart[defType] : 1;
+      if (mult === 0) immuneTo.push(atkType);
+      else if (mult > 1) weakTo.push(atkType);
+      else if (mult < 1) resists.push(atkType);
+    }
+    return { type: defType, weakTo, resists, immuneTo };
+  });
+}
+
 function stripRank(user) {
   return String(user || "").replace(/^[^A-Za-z0-9]+/, "");
+}
+
+export function cleanRawHtml(html) {
+  if (!html) return "";
+  return String(html)
+    .replace(/<img[^>]*alt=["']?([^"'>]+)["']?[^>]*>/gi, " [$1] ")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/&ThickSpace;/gi, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export function formatBattleLine(type, parts, mySide = null) {
@@ -121,7 +156,8 @@ export function formatBattleLine(type, parts, mySide = null) {
 
   switch (type) {
     case "raw":
-      return parts[0];
+    case "html":
+      return cleanRawHtml(parts.join("|"));
     case "player":
     case "teamsize":
     case "gametype":
@@ -137,7 +173,6 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "n":
     case "N":
     case ":":
-    case "html":
     case "uhtml":
     case "uhtmlchange":
     case "formats":
@@ -148,10 +183,22 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "users":
       return null;
     case "c":
-    case "chat":
-      return `${stripRank(parts[0])}: ${parts.slice(1).join("|")}`;
-    case "c:":
-      return `${stripRank(parts[1])}: ${parts.slice(2).join("|")}`;
+    case "chat": {
+      const user = stripRank(parts[0]);
+      let text = parts.slice(1).join("|");
+      if (text.startsWith("/raw ")) {
+        text = cleanRawHtml(text.slice(5));
+      }
+      return `${user}: ${text}`;
+    }
+    case "c:": {
+      const user = stripRank(parts[1]);
+      let text = parts.slice(2).join("|");
+      if (text.startsWith("/raw ")) {
+        text = cleanRawHtml(text.slice(5));
+      }
+      return `${user}: ${text}`;
+    }
     case "inactive":
     case "inactiveoff":
       return parts[0] || null; 
