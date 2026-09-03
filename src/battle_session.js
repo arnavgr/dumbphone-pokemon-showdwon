@@ -456,7 +456,11 @@ export class BattleSession extends DurableObject {
   async _doEnsureConnected() {
     if (this.ws && this.ws.readyState === 1) return;
 
-    if (!this.state_.upstreamCookie) {
+    // If already logged in, preserve the existing upstreamCookie to maintain authenticated session
+    const wasLoggedIn = this.state_.loggedIn;
+    const existingCookie = wasLoggedIn ? this.state_.upstreamCookie : null;
+    
+    if (!existingCookie && !this.state_.upstreamCookie) {
       try {
         const infoRes = await fetch("https://sim3.psim.us/showdown/info");
         const sc = infoRes.headers.get("Set-Cookie");
