@@ -1,5 +1,6 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 
+const SHOWDOWN_INFO_URL = "https://sim3.psim.us/showdown/info";
 const TEAMS_URL = "https://teams.pokemonshowdown.com/api/getteams?full=1";
 
 function buildProxyDispatcher() {
@@ -35,15 +36,27 @@ function normaliseTeam(raw) {
   };
 }
 
-export async function fetchRemoteTeams(upstreamCookie) {
-  if (!upstreamCookie) {
-    throw new Error("No authenticated Showdown session is available for team storage.");
-  }
+async function fetchShowdownSid() {
+  const dispatcher = buildProxyDispatcher();
+  const options = {
+    headers: { Accept: "application/json", "User-Agent": "ps-cloudphone-team-picker" },
+  };
+  if (dispatcher) options.dispatcher = dispatcher;
 
+  const res = await undiciFetch(SHOWDOWN_INFO_URL, options);
+  if (!res.ok) throw new Error(`Showdown session endpoint returned HTTP ${res.status}.`);
+  const setCookie = res.headers.get("set-cookie") || "";
+  const match = setCookie.match(/(?:^|,\s*)(sid=[^;,]+)/i);
+  if (!match) throw new Error("Showdown did not provide a session cookie for the team server.");
+  return match[1];
+}
+
+export async function fetchRemoteTeams(upstreamCookie) {
+  const cookie = upstreamCookie || await fetchShowdownSid();
   const dispatcher = buildProxyDispatcher();
   const options = {
     headers: {
-      Cookie: upstreamCookie,
+      Cookie: cookie,
       Accept: "application/json",
       "User-Agent": "ps-cloudphone-team-picker",
     },
@@ -62,17 +75,16 @@ export async function fetchRemoteTeams(upstreamCookie) {
   }
 
   const source = Array.isArray(data) ? data : (data?.teams || data?.data || []);
-  const teams = source.map(normaliseTeam).filter(Boolean);
-  return teams;
+  return source.map(normaliseTeam).filter(Boolean);
 }
 
 export function teamMatchesFormat(team, format) {
   const f = String(format || "").toLowerCase();
-  const tf = String(team?.format || "").toLowerCase();
+  const tf = String(team?.format || "").toLowerCase().trim();
   if (!tf) return false;
 
   if (f === "gen9ou") {
-    return tf === "gen9ou" || tf === "gen9overused" || tf === "ou";
+    return ["gen9ou", "gen9overused", "gen9overusedou", "ou", "gen 9 ou", "[gen 9] ou"].includes(tf) || /gen\s*9.*ou/.test(tf);
   }
   return tf === f;
 }
