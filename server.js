@@ -2,6 +2,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
 import { BattleSession } from "./src/battle_session.js";
+import { renderBattle } from "./src/html.js";
 import { renderEnhancedBattle } from "./src/battle_intel.js";
 
 const app = express();
@@ -99,6 +100,28 @@ app.get("/sprite/*", async (req, res) => {
   return res.status(404).send("Sprite not found");
 });
 
+// Extract only the intelligence sections from the enhanced renderer. This
+// lets the project keep the mature battle renderer (chat, field, timer,
+// move descriptions, etc.) while adding the new analysis above the log.
+function extractBattleIntel(html) {
+  const startMarkers = [
+    '<h2>Speed comparison</h2>',
+    '<h2>Damage / KO estimator</h2>',
+    '<h2>Smart switch recommendations</h2>',
+    '<h2>Opponent dossier</h2>',
+  ];
+  let start = -1;
+  for (const marker of startMarkers) {
+    const idx = html.indexOf(marker);
+    if (idx !== -1 && (start === -1 || idx < start)) start = idx;
+  }
+  if (start === -1) return "";
+
+  const end = html.indexOf('<hr><h2>Battle actions</h2>', start);
+  if (end === -1) return "";
+  return html.slice(start, end);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP Session Gateway
 // ---------------------------------------------------------------------------
@@ -117,14 +140,17 @@ app.all("*", async (req, res) => {
 
   const session = getSession(sid);
 
-  // The enhanced battle page uses only normal server-rendered HTML, links,
-  // and forms, so it remains usable on keypad-only browsers without relying
-  // on numeric-key JavaScript behavior. All action endpoints still flow
-  // through BattleSession unchanged.
   if (req.path === "/battle" && req.method === "GET") {
     try {
       await session.ensureConnected();
-      return res.send(await renderEnhancedBattle(session.state_));
+      const normalHtml = renderBattle(session.state_);
+      const enhancedHtml = await renderEnhancedBattle(session.state_);
+      const intel = extractBattleIntel(enhancedHtml);
+      if (!intel) return res.send(normalHtml);
+
+      const marker = "<h2>Log</h2>";
+      if (!normalHtml.includes(marker)) return res.send(normalHtml);
+      return res.send(normalHtml.replace(marker, `${intel}${marker}`));
     } catch (err) {
       return res.status(503).send(
         `Battle page unavailable: ${String(err?.message || err)}<br><a href="/">Home</a>`
