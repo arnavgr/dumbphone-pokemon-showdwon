@@ -1,22 +1,4 @@
-import { ProxyAgent, fetch as undiciFetch } from "undici";
-
 const TEAMS_URL = "https://teams.pokemonshowdown.com/api/getteams?full=1";
-
-function buildProxyDispatcher() {
-  const proxyUrl = process.env.PROXY_URL;
-  if (!proxyUrl) return undefined;
-  try {
-    const u = new URL(proxyUrl);
-    const opts = { uri: `${u.protocol}//${u.host}` };
-    if (u.username || u.password) {
-      const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
-      opts.token = `Basic ${Buffer.from(creds).toString("base64")}`;
-    }
-    return new ProxyAgent(opts);
-  } catch {
-    return undefined;
-  }
-}
 
 function normaliseTeam(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -40,17 +22,14 @@ export async function fetchRemoteTeams(upstreamCookie) {
     throw new Error("No authenticated Showdown session is available for team storage.");
   }
 
-  const dispatcher = buildProxyDispatcher();
-  const options = {
+  const res = await fetch(TEAMS_URL, {
     headers: {
       Cookie: upstreamCookie,
       Accept: "application/json",
       "User-Agent": "ps-cloudphone-team-picker",
     },
-  };
-  if (dispatcher) options.dispatcher = dispatcher;
+  });
 
-  const res = await undiciFetch(TEAMS_URL, options);
   if (!res.ok) throw new Error(`Team server returned HTTP ${res.status}.`);
 
   const text = await res.text();
@@ -66,12 +45,19 @@ export async function fetchRemoteTeams(upstreamCookie) {
 }
 
 export function teamMatchesFormat(team, format) {
-  const f = String(format || "").toLowerCase();
+  const f = String(format || "").toLowerCase().trim();
   const tf = String(team?.format || "").toLowerCase().trim();
   if (!tf) return false;
 
   if (f === "gen9ou") {
-    return ["gen9ou", "gen9overused", "gen9overusedou", "ou", "gen 9 ou", "[gen 9] ou"].includes(tf) || /gen\s*9.*ou/.test(tf);
+    return [
+      "gen9ou",
+      "gen9overused",
+      "gen9overusedou",
+      "ou",
+      "gen 9 ou",
+      "[gen 9] ou",
+    ].includes(tf) || /gen\s*9.*ou/.test(tf);
   }
   return tf === f;
 }
