@@ -2,6 +2,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
 import { BattleSession } from "./src/battle_session.js";
+import { renderEnhancedBattle } from "./src/battle_intel.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -115,6 +116,22 @@ app.all("*", async (req, res) => {
   }
 
   const session = getSession(sid);
+
+  // The enhanced battle page uses only normal server-rendered HTML, links,
+  // and forms, so it remains usable on keypad-only browsers without relying
+  // on numeric-key JavaScript behavior. All action endpoints still flow
+  // through BattleSession unchanged.
+  if (req.path === "/battle" && req.method === "GET") {
+    try {
+      await session.ensureConnected();
+      return res.send(await renderEnhancedBattle(session.state_));
+    } catch (err) {
+      return res.status(503).send(
+        `Battle page unavailable: ${String(err?.message || err)}<br><a href="/">Home</a>`
+      );
+    }
+  }
+
   await session.handleRequest(req, res);
 });
 
