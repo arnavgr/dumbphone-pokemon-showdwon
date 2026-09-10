@@ -60,6 +60,12 @@ export class BattleSession extends BaseBattleSession {
     this.pendingChoices = [];
   }
 
+  resetBattle() {
+    super.resetBattle();
+    this.pendingChoices = [];
+    if (this.state_) this.state_.pendingChoices = [];
+  }
+
   async startSearch(format, packedTeam = null) {
     await this.ensureConnected();
     if (this.state_.loginName) await this.autoRelogin();
@@ -123,10 +129,9 @@ export class BattleSession extends BaseBattleSession {
   }
 
   async renderBattlePage() {
+    this.state_.pendingChoices = Array.isArray(this.pendingChoices) ? [...this.pendingChoices] : [];
     let html = renderModeBattle(this.state_);
     try {
-      // render_ui owns the battle layout and doubles controls. The enhanced
-      // renderer contributes the calculation-heavy damage and switch sections.
       html = removeSection(html, "Damage / KO estimate");
       const enhanced = await renderEnhancedBattle(this.state_);
       const damage = extractSection(enhanced, "Damage / KO estimator");
@@ -254,6 +259,7 @@ export class BattleSession extends BaseBattleSession {
         if (!Array.isArray(this.pendingChoices) || this.pendingChoices.length !== reqData.active.length) {
           this.pendingChoices = Array(reqData.active.length).fill(null);
         }
+        this.state_.pendingChoices = [...this.pendingChoices];
 
         const slotRaw = String(url.searchParams.get("slot") || "");
         let choice = String(url.searchParams.get("choice") || "");
@@ -270,12 +276,14 @@ export class BattleSession extends BaseBattleSession {
           if (choice === "undo") this.pendingChoices[slot] = null;
           else if (choice) this.pendingChoices[slot] = choice;
         }
+        this.state_.pendingChoices = [...this.pendingChoices];
 
         const complete = this.pendingChoices.length === reqData.active.length && this.pendingChoices.every(Boolean);
         if (complete) {
           const combined = this.pendingChoices.join(",");
           this.sendToRoom(this.state_.roomId, `/choose ${combined}${reqData.rqid !== undefined ? `|${reqData.rqid}` : ""}`);
           this.pendingChoices = [];
+          this.state_.pendingChoices = [];
           this.state_.request = null;
           await this.save();
         }
@@ -291,6 +299,7 @@ export class BattleSession extends BaseBattleSession {
         }
         this.sendToRoom(this.state_.roomId, `/choose team ${order}|${reqData.rqid || ""}`);
         this.pendingChoices = [];
+        this.state_.pendingChoices = [];
         this.state_.request = null;
         await this.save();
         return Response.redirect(new URL("/battle", url), 302);
