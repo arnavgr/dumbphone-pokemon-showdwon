@@ -1,4 +1,4 @@
-import { BattleSession } from "./battle_session.js";
+import { BattleSession } from "./battle_session_cf.js";
 export { BattleSession };
 
 function getCookie(request, name) {
@@ -61,8 +61,7 @@ async function handleSprite(request, url) {
   try {
     const cached = await caches.default.match(cacheKey);
     if (cached) return cached;
-  } catch {
-  }
+  } catch {}
 
   const sources = [
     "https://play.pokemonshowdown.com/sprites/",
@@ -71,34 +70,19 @@ async function handleSprite(request, url) {
 
   for (const candidate of spriteCandidates(path)) {
     for (const base of sources) {
-      const upstreamUrl = base + candidate;
-
       let upstream;
       try {
-        upstream = await fetch(upstreamUrl, {
-          headers: { "User-Agent": "ps-cloudphone-sprite-proxy" },
-        });
+        upstream = await fetch(base + candidate, { headers: { "User-Agent": "ps-cloudphone-sprite-proxy" } });
       } catch {
         continue;
       }
-
       if (!upstream.ok) continue;
 
       const headers = new Headers();
-      headers.set(
-        "content-type",
-        upstream.headers.get("content-type") ||
-          (candidate.endsWith(".gif") ? "image/gif" : "image/png")
-      );
+      headers.set("content-type", upstream.headers.get("content-type") || (candidate.endsWith(".gif") ? "image/gif" : "image/png"));
       headers.set("cache-control", "public, max-age=86400");
-
       const response = new Response(upstream.body, { status: 200, headers });
-
-      try {
-        await caches.default.put(cacheKey, response.clone());
-      } catch {
-      }
-
+      try { await caches.default.put(cacheKey, response.clone()); } catch {}
       return response;
     }
   }
@@ -110,13 +94,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname.startsWith("/sprite/")) {
-      return handleSprite(request, url);
-    }
+    if (url.pathname.startsWith("/sprite/")) return handleSprite(request, url);
 
     let sid = getCookie(request, "sid");
     let setCookie = null;
-
     if (!sid) {
       sid = crypto.randomUUID();
       setCookie = `sid=${sid}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`;
@@ -124,7 +105,6 @@ export default {
 
     const id = env.BATTLE_SESSION.idFromName(sid);
     const stub = env.BATTLE_SESSION.get(id);
-
     const resp = await stub.fetch(request);
 
     if (setCookie) {
@@ -132,7 +112,6 @@ export default {
       headers.append("Set-Cookie", setCookie);
       return new Response(resp.body, { status: resp.status, headers });
     }
-
     return resp;
   },
 };
