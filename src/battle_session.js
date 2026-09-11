@@ -1,5 +1,7 @@
 import WebSocket from "ws";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import {
@@ -12,6 +14,8 @@ import {
   spriteUrl,
   typeEffectiveness,
   cleanRawHtml,
+  FORMATS,
+  formatNeedsTeam,
 } from "./protocol.js";
 import {
   renderHome,
@@ -23,6 +27,7 @@ import {
   renderDebug,
   renderTypeChart,
   renderCommands,
+  renderTeams,
 } from "./html.js";
 
 const SHOWDOWN_WS_URL = "wss://sim3.psim.us/showdown/websocket";
@@ -83,9 +88,37 @@ function decryptCredentials(cookieStr) {
   }
 }
 
-const RECONNECT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];
-const QUICK_DROP_THRESHOLD_MS = 15000;
-const MAX_AUTO_RECONNECT_ATTEMPTS = 8;
+// ---------------------------------------------------------------------------
+// Team storage - keyed by logged-in Showdown username, persisted best-effort
+// to data/teams.json so teams survive restarts/redeploys when the disk allows.
+// ---------------------------------------------------------------------------
+const TEAMS_FILE = path.join(process.cwd(), "data", "teams.json");
+
+function loadTeamsStore() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(TEAMS_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+const teamsStore = loadTeamsStore();
+function saveTeamsStore() {
+  try {
+    fs.mkdirSync(path.dirname(TEAMS_FILE), { recursive: true });
+    fs.writeFileSync(TEAMS_FILE, JSON.stringify(teamsStore));
+  } catch {
+    // read-only filesystem: teams just live until the next restart
+  }
+}
+
+const NATURES = new Set([
+  "hardy", "lonely", "brave", "adamant", "naughty",
+  "bold", "docile", "relaxed", "impish", "lax",
+  "timid", "hasty", "serious", "jolly", "naive",
+  "modest", "mild", "quiet", "rash",
+  "calm", "gentle", "sassy", "careful", "quirky",
+]);
 
 let pokedexCache = null;
 let pokedexPromise = null;
@@ -111,6 +144,168 @@ async function getMoves() {
       .catch(() => { movesCache = {}; return movesCache; });
   }
   return movesPromise;
+}
+
+let itemsCache = null;
+let itemsPromise = null;
+async function getItems() {
+  if (itemsCache) return itemsCache;
+  if (!itemsPromise) {
+    itemsPromise = fetch("https://play.pokemonshowdown.com/data/items.json")
+      .then((res) => (res.ok ? res.json() : {}))
+      .then((data) => { itemsCache = data || {}; return itemsCache; })
+      .catch(() => { itemsCache = {}; return itemsCache; });
+  }
+  return itemsPromise;
+}
+
+// ---------------------------------------------------------------------------
+// Team import: parse a Showdown-exported team (teambuilder "Export" text),
+// validate it against the fetched dex/moves/items, and produce the packed
+// string that /utm expects. Tera type is intentionally not packed - the sim
+// defaults it to the Pokemon's first type, and the battle request tells the
+// player which Tera type is available.
+// ---------------------------------------------------------------------------
+async function importTeam(text) {
+  const dex = await getPokedex();
+  const movesData = await getMoves();
+  const itemsData = await getItems();
+
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^={3,}/.test(l));
+
+  const statMap = {
+    hp: "hp", atk: "atk", attack: "atk", def: "def", defense: "def",
+    spa: "spa", specialattack: "spa", spatk: "spa",
+    spd: "spd", specialdefense: "spd", spdef: "spd",
+    spe: "spe", speed: "spe",
+  };
+  const statFrom = (s) => statMap[normalizeName(s)];
+  const parseSpread = (s, bag) => {
+    for (const part of String(s).split("/")) {
+      const m = part.trim().match(/^(\d+)\s+([A-Za-z ]+)$/);
+      if (m) {
+        const key = statFrom(m[2]);
+        if (key) bag[key] = Number(m[1]) || 0;
+      }
+    }
+  };
+
+  const sets = [];
+  let cur = null;
+  for (const line of lines) {
+    if (/^[-\u2022\u00b7\u2013]\s+/.test(line)) {
+      if (cur && cur.moves.length < 4) {
+        cur.moves.push(line.replace(/^[-\u2022\u00b7\u2013]\s+/, "").trim());
+      }
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^Ability:\s*(.+)$/i))) { if (cur) cur.ability = m[1].trim(); continue; }
+    if ((m = line.match(/^Level:\s*(\d+)$/i))) { if (cur) cur.level = Number(m[1]); continue; }
+    if ((m = line.match(/^Happiness:\s*(\d+)$/i))) { if (cur) cur.happiness = Number(m[1]); continue; }
+    if (/^Shiny:\s*(Yes|True)$/i.test(line)) { if (cur) cur.shiny = true; continue; }
+    if (/^Gigantamax:\s*(Yes|True)$/i.test(line)) { if (cur) cur.gmax = true; continue; }
+    if ((m = line.match(/^Tera Type:\s*(.+)$/i))) { if (cur) cur.teraType = m[1].trim(); continue; }
+    if ((m = line.match(/^EVs:\s*(.+)$/i))) { if (cur) parseSpread(m[1], cur.evs); continue; }
+    if ((m = line.match(/^IVs:\s*(.+)$/i))) { if (cur) parseSpread(m[1], cur.ivs); continue; }
+    if ((m = line.match(/^([A-Za-z]+)\s+Nature$/i))) { if (cur) cur.nature = m[1].trim(); continue; }
+
+    // Otherwise: a new set header line ("Species @ Item" or "Nick (Species) @ Item")
+    const atSplit = line.split("@");
+    const head = atSplit[0].trim();
+    if (!head) continue;
+    let item = atSplit.slice(1).join("@").trim().replace(/\s*\([MF]\)$/i, "");
+    let species = head;
+    let nick = "";
+    const paren = head.match(/^(.*)\(([^()]*)\)\s*$/);
+    if (paren && /^[MF]$/i.test(paren[2].trim())) {
+      species = paren[1].trim(); // trailing gender marker, not a nickname
+    } else if (paren) {
+      nick = paren[1].trim();
+      species = paren[2].trim();
+    }
+    cur = {
+      nick: nick.replace(/[|\[\]]/g, "").trim(),
+      species,
+      item,
+      ability: "",
+      nature: "",
+      evs: {},
+      ivs: {},
+      moves: [],
+      level: 100,
+      shiny: false,
+      happiness: 255,
+    };
+    sets.push(cur);
+  }
+
+  if (!sets.length) {
+    throw new Error("No Pokemon found - paste a Showdown-exported team (teambuilder -> Export).");
+  }
+  if (sets.length > 6) throw new Error("A team can have at most 6 Pokemon.");
+
+  const packedSets = [];
+  const summary = [];
+  for (const set of sets) {
+    const spId = normalizeName(set.species);
+    const entry = dex[spId];
+    if (!entry) throw new Error(`Unknown Pokemon: "${set.species}"`);
+    const speciesName = entry.name;
+
+    const moves = set.moves.map((mv) => {
+      const mvId = normalizeName(String(mv).replace(/\s*\[.*\]\s*$/, ""));
+      if (!movesData[mvId]) throw new Error(`${speciesName}: unknown move "${mv}"`);
+      return mvId;
+    });
+    if (!moves.length) throw new Error(`${speciesName} has no moves.`);
+
+    const itemId = set.item ? normalizeName(set.item) : "";
+    if (itemId && !itemsData[itemId]) throw new Error(`${speciesName}: unknown item "${set.item}"`);
+
+    let abilityId = set.ability ? normalizeName(set.ability) : "";
+    if (!abilityId && entry.abilities) {
+      abilityId = normalizeName(entry.abilities["0"] || Object.values(entry.abilities)[0]);
+    }
+
+    const natureId = set.nature ? normalizeName(set.nature) : "serious";
+    if (!NATURES.has(natureId)) throw new Error(`${speciesName}: unknown nature "${set.nature}"`);
+
+    const evKeys = ["hp", "atk", "def", "spa", "spd", "spe"];
+    const evs = evKeys.map((k) => Math.max(0, Math.min(252, Number(set.evs[k]) || 0)));
+    if (evs.reduce((a, b) => a + b, 0) > 510) {
+      throw new Error(`${speciesName}: more than 510 total EVs.`);
+    }
+    const ivs = evKeys.map((k) => {
+      const v = set.ivs[k];
+      return v === undefined ? 31 : Math.max(0, Math.min(31, Number(v) || 0));
+    });
+
+    const level = Math.max(1, Math.min(100, Number(set.level) || 100));
+    const namePart =
+      set.nick && normalizeName(set.nick) !== normalizeName(speciesName)
+        ? `${set.nick}|${spId}`
+        : spId;
+
+    packedSets.push([
+      namePart,
+      itemId,
+      abilityId,
+      moves.join(","),
+      natureId,
+      evs.join(","),
+      ivs.join(","),
+      set.shiny ? "S" : "",
+      String(level),
+      set.happiness !== 255 ? String(set.happiness) : "",
+    ].join("|"));
+    summary.push(speciesName);
+  }
+
+  return { packed: packedSets.join("]"), count: sets.length, summary: summary.join(", ") };
 }
 
 function cleanSideCond(s) {
@@ -152,6 +347,13 @@ const DEFAULT_STATE = {
   ipLocked: false,
   ipLockedAt: null,
   ipLockedMsg: null,
+  gameType: null,
+  dexData: null,
+  movesData: null,
+  lastTeam: {},
+  teamNext: null,
+  teamError: null,
+  teamView: null,
 };
 
 export class BattleSession {
@@ -204,6 +406,7 @@ export class BattleSession {
       active: {},
       revealed: {},
       field: { weather: null, fields: [], sides: {} },
+      gameType: null,
     });
   }
 
@@ -251,9 +454,8 @@ export class BattleSession {
       : [];
 
     // If this Pokemon was already revealed earlier in the battle (e.g. it
-    // Terastallized before switching out), restore that instead of
-    // resetting to its base dex data. Terastallization lasts the whole
-    // battle, so a switched-out mon keeps its Tera type when it comes back.
+    // Terastallized or Mega Evolved before switching out), restore that
+    // instead of resetting to its base dex data.
     const revealedEntry = this.state_.revealed[sideKey(p.side)]?.[id];
     const teraType = revealedEntry?.teraType || null;
     if (teraType) types = [teraType];
@@ -340,6 +542,45 @@ export class BattleSession {
     } else {
       const delta = mode === "down" ? -amt : amt;
       mon.boosts[stat] = Math.max(-6, Math.min(6, (mon.boosts[stat] || 0) + delta));
+    }
+  }
+
+  // Shared by -formechange and -mega: swap species, retype, re-speed, re-sprite,
+  // and record the forme in the revealed map if it's new.
+  async applyFormeChange(side, newSpecies) {
+    const mon = this.state_.active[side];
+    if (!mon || !newSpecies) return;
+    const dex = await getPokedex();
+    const entry = dex[normalizeName(newSpecies)] || {};
+    mon.species = newSpecies;
+    if (mon.teraType) {
+      mon.types = [mon.teraType];
+    } else if (entry.types) {
+      mon.types = entry.types;
+    }
+    if (entry.abilities) {
+      mon.possibleAbilities = [...new Set(Object.values(entry.abilities))];
+    }
+    if (entry.baseStats && Number.isFinite(entry.baseStats.spe) && mon.level) {
+      mon.predictedSpeed =
+        Math.floor(((2 * entry.baseStats.spe + 85) * mon.level) / 100) + 5;
+    }
+    mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
+    mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
+    const map = this.state_.revealed[sideKey(side)];
+    if (map && !map[normalizeName(newSpecies)]) {
+      map[normalizeName(newSpecies)] = {
+        species: newSpecies,
+        nickname: mon.nickname,
+        level: mon.level,
+        condition: mon.condition,
+        types: mon.types || [],
+        teraType: mon.teraType || null,
+        ability: mon.ability || null,
+        item: mon.item || null,
+        usedMoves: [...(mon.usedMoves || [])],
+        lastSeenTurn: this.state_.turn,
+      };
     }
   }
 
@@ -599,6 +840,26 @@ export class BattleSession {
     }, delay);
   }
 
+  // Resolve which stored team to use for a team format. Returns { team, idx }
+  // or null if none is available.
+  pickTeam(format, explicitIdx) {
+    const user = normalizeName(this.state_.loginName || "");
+    const list = teamsStore[user] || [];
+    let picked = null;
+    let pickedIdx = -1;
+    if (Number.isInteger(explicitIdx) && explicitIdx >= 0 && explicitIdx < list.length) {
+      picked = list[explicitIdx];
+      pickedIdx = explicitIdx;
+    } else {
+      const lastIdx = this.state_.lastTeam[format];
+      if (Number.isInteger(lastIdx) && lastIdx >= 0 && lastIdx < list.length) {
+        picked = list[lastIdx];
+        pickedIdx = lastIdx;
+      }
+    }
+    return picked ? { team: picked, idx: pickedIdx } : null;
+  }
+
   async handleLine(roomId, rawLine) {
     const { type, parts } = parseLine(rawLine);
     const mySide = this.state_.mySide;
@@ -702,6 +963,11 @@ export class BattleSession {
         break;
       }
 
+      case "gametype": {
+        this.state_.gameType = parts[0] || null;
+        break;
+      }
+
       case "updatesearch": {
         try {
           const json = JSON.parse(parts[0]);
@@ -756,6 +1022,9 @@ export class BattleSession {
 
           const dex = await getPokedex();
           const movesData = await getMoves();
+          // Stash for the server-rendered damage estimates (renderBattle is sync).
+          this.state_.dexData = dex;
+          this.state_.movesData = movesData;
 
           if (req.side && req.side.pokemon) {
             for (const p of req.side.pokemon) {
@@ -800,6 +1069,11 @@ export class BattleSession {
                   if (data.type) m.type = data.type;
                   if (data.category) m.category = data.category;
                   if (data.shortDesc || data.desc) m.shortDesc = data.shortDesc || data.desc;
+                  // Extra fields the damage estimator needs.
+                  if (Number.isFinite(data.basePower)) m.basePower = data.basePower;
+                  if (data.multihit) m.multihit = data.multihit;
+                  if (data.damage !== undefined) m.damage = data.damage;
+                  if (data.target) m.target = data.target;
                 }
                 if (m.category !== "Status" && m.type && oppTypes.length) {
                   m.oppMult = typeEffectiveness(m.type, oppTypes);
@@ -973,6 +1247,16 @@ export class BattleSession {
         break;
       }
 
+      case "-mega": {
+        if (inBattle) {
+          const p = parseIdent(parts[0] || "");
+          const newSpecies = String(parts[1] || "").split(",")[0].trim();
+          await this.applyFormeChange(p.side, newSpecies);
+        }
+        this.pushLog(formatBattleLine(type, parts, mySide));
+        break;
+      }
+
       case "-terastallize": {
         if (inBattle) {
           const p = parseIdent(parts[0] || "");
@@ -992,45 +1276,8 @@ export class BattleSession {
       case "-formechange": {
         if (inBattle) {
           const p = parseIdent(parts[0] || "");
-          const mon = this.state_.active[p.side];
           const newSpecies = String(parts[1] || "").split(",")[0].trim();
-          if (mon && newSpecies) {
-            const dex = await getPokedex();
-            const entry = dex[normalizeName(newSpecies)] || {};
-            mon.species = newSpecies;
-            if (mon.teraType) {
-              mon.types = [mon.teraType];
-            } else if (entry.types) {
-              mon.types = entry.types;
-            }
-            if (entry.abilities) {
-              mon.possibleAbilities = [...new Set(Object.values(entry.abilities))];
-            }
-            if (entry.baseStats && Number.isFinite(entry.baseStats.spe) && mon.level) {
-              mon.predictedSpeed =
-                Math.floor(((2 * entry.baseStats.spe + 85) * mon.level) / 100) + 5;
-            }
-            mon.spriteFront = spriteUrl(newSpecies, { shiny: mon.shiny, back: false, anim: ANIMATED_SPRITES });
-            mon.spriteBack = spriteUrl(newSpecies, { shiny: mon.shiny, back: true, anim: ANIMATED_SPRITES });
-            const map = this.state_.revealed[sideKey(p.side)];
-            if (map) {
-              const key = normalizeName(newSpecies);
-              if (!map[key]) {
-                map[key] = {
-                  species: newSpecies,
-                  nickname: mon.nickname,
-                  level: mon.level,
-                  condition: mon.condition,
-                  types: mon.types || [],
-                  teraType: mon.teraType || null,
-                  ability: mon.ability || null,
-                  item: mon.item || null,
-                  usedMoves: [...(mon.usedMoves || [])],
-                  lastSeenTurn: this.state_.turn,
-                };
-              }
-            }
-          }
+          await this.applyFormeChange(p.side, newSpecies);
         }
         this.pushLog(formatBattleLine(type, parts, mySide));
         break;
@@ -1175,6 +1422,11 @@ export class BattleSession {
       const path = req.path;
 
       if (path === "/search") {
+        const format = String(req.query.format || "gen9randombattle");
+        if (!FORMATS.some(([id]) => id === format)) {
+          return res.status(400).send(renderError(`Unknown or unsupported format: ${format}`));
+        }
+
         if (this.state_.roomId) {
           try { this.sendToRoom(this.state_.roomId, "/leave"); } catch {}
           this.resetBattle();
@@ -1189,12 +1441,30 @@ export class BattleSession {
           }
         }
 
-        const format = req.query.format || "gen9randombattle";
+        // Team formats need /utm with a packed team before /search.
+        let teamPacked = null;
+        if (formatNeedsTeam(format)) {
+          const explicitIdx = Number(req.query.team);
+          const picked =
+            Number.isInteger(explicitIdx)
+              ? this.pickTeam(format, explicitIdx)
+              : this.pickTeam(format, undefined);
+          if (!picked) {
+            this.state_.teamNext = format;
+            this.state_.notice = `${format} needs a team - pick or upload one below.`;
+            return res.redirect("/teams");
+          }
+          if (Number.isInteger(explicitIdx) && picked.idx === explicitIdx) {
+            this.state_.lastTeam[format] = picked.idx; // remember for next time
+          }
+          teamPacked = picked.team.packed;
+        }
+
         if (this.state_.searching.length > 0) {
           try { this.send(`|/cancelsearch`); } catch {}
         }
 
-        this.send(`|/utm null`);
+        this.send(`|/utm ${teamPacked || "null"}`);
         this.send(`|/search ${format}`);
 
         const hadBattle = !!(this.state_.roomId && !this.state_.ended);
@@ -1237,12 +1507,28 @@ export class BattleSession {
       if (path === "/challenge") {
         if (req.method === "POST") {
           const target = (req.body.username || "").trim();
-          const format = req.body.format || "gen9randombattle";
+          const format = String(req.body.format || "");
           if (target) {
+            if (!FORMATS.some(([id]) => id === format)) {
+              this.state_.notice = `Unknown format: ${format}`;
+              return res.redirect("/");
+            }
             if (this.state_.loginName) {
               await this.autoRelogin();
             }
-            this.send(`|/utm null`);
+            let utm = "null";
+            if (formatNeedsTeam(format)) {
+              const idx = Number(req.body.team);
+              const picked = this.pickTeam(format, Number.isInteger(idx) ? idx : undefined);
+              if (!picked) {
+                this.state_.teamNext = format;
+                this.state_.notice = `${format} needs a team - pick or upload one below, then challenge again.`;
+                return res.redirect("/teams");
+              }
+              this.state_.lastTeam[format] = picked.idx;
+              utm = picked.team.packed;
+            }
+            this.send(`|/utm ${utm}`);
             this.send(`|/challenge ${target}, ${format}`);
             this.state_.notice = `Challenge sent to ${target}.`;
           }
@@ -1264,7 +1550,14 @@ export class BattleSession {
           if (this.state_.loginName) {
             await this.autoRelogin();
           }
-          this.send(`|/utm null`);
+          // If the incoming challenge is a team format, attach the remembered team.
+          const fmt = this.state_.challengesFrom?.[user] || "";
+          if (formatNeedsTeam(fmt)) {
+            const picked = this.pickTeam(fmt, undefined);
+            this.send(`|/utm ${picked ? picked.team.packed : "null"}`);
+          } else {
+            this.send(`|/utm null`);
+          }
           this.send(`|/accept ${user}`);
         }
         return res.redirect("/");
@@ -1326,6 +1619,67 @@ export class BattleSession {
           }
         }
         return res.redirect("/battle");
+      }
+
+      if (path === "/teams") {
+        const user = normalizeName(this.state_.loginName || "");
+        if (!user) {
+          this.state_.notice = "Log in first - teams are stored per account.";
+          return res.redirect("/login");
+        }
+        const next = String(req.query.next || this.state_.teamNext || "");
+        this.state_.teamNext = next || null;
+        this.state_.teamView = { list: teamsStore[user] || [], next };
+        const html = renderTeams(this.state_);
+        this.state_.teamError = null;
+        return res.send(html);
+      }
+
+      if (path === "/teams/upload" && req.method === "POST") {
+        const user = normalizeName(this.state_.loginName || "");
+        if (!user) {
+          this.state_.notice = "Log in first - teams are stored per account.";
+          return res.redirect("/login");
+        }
+        const next = String(req.query.next || this.state_.teamNext || "");
+        const name = String(req.body.name || "").replace(/[<>]/g, "").trim().slice(0, 40);
+        const text = String(req.body.teamtext || "");
+        try {
+          const parsed = await importTeam(text);
+          const list = teamsStore[user] || (teamsStore[user] = []);
+          if (list.length >= 12) throw new Error("Team limit reached (12). Delete one first.");
+          list.push({
+            name: name || `Team ${list.length + 1}`,
+            packed: parsed.packed,
+            summary: parsed.summary,
+            count: parsed.count,
+            added: Date.now(),
+          });
+          saveTeamsStore();
+          this.state_.notice = `Team saved: ${name || "Unnamed"}.`;
+        } catch (err) {
+          this.state_.teamError = err.message || String(err);
+        }
+        this.state_.teamNext = next || null;
+        return res.redirect("/teams");
+      }
+
+      if (path === "/team/delete") {
+        const user = normalizeName(this.state_.loginName || "");
+        const idx = Number(req.query.id);
+        const list = teamsStore[user];
+        if (list && Number.isInteger(idx) && idx >= 0 && idx < list.length) {
+          list.splice(idx, 1);
+          if (!list.length) delete teamsStore[user];
+          // Fix remembered-team indexes so they don't point at the wrong team.
+          for (const fmt of Object.keys(this.state_.lastTeam)) {
+            const li = this.state_.lastTeam[fmt];
+            if (li === idx) delete this.state_.lastTeam[fmt];
+            else if (li > idx) this.state_.lastTeam[fmt] = li - 1;
+          }
+          saveTeamsStore();
+        }
+        return res.redirect("/teams");
       }
 
       if (path === "/moveinfo") {
@@ -1438,9 +1792,12 @@ export class BattleSession {
 
       if (path === "/battle") {
         if (!this.state_.roomId) return res.redirect("/");
-        return res.send(renderBattle(this.state_));
+        return res.send(renderBattle(this.state_, String(req.query.part || "")));
       }
 
+      // Home page needs the team list for the challenge form.
+      const homeUser = normalizeName(this.state_.loginName || "");
+      this.state_.teamView = { list: teamsStore[homeUser] || [], next: this.state_.teamNext || "" };
       const homeHtml = renderHome(this.state_);
       if (this.state_.notice) this.state_.notice = null;
       return res.send(homeHtml);
@@ -1449,3 +1806,7 @@ export class BattleSession {
     }
   }
 }
+
+const QUICK_DROP_THRESHOLD_MS = 15000;
+const MAX_AUTO_RECONNECT_ATTEMPTS = 8;
+const RECONNECT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];

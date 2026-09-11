@@ -1,12 +1,19 @@
-import { spriteUrl, typeEffectiveness, typeChartTable } from "./protocol.js";
+import {
+  spriteUrl,
+  typeEffectiveness,
+  typeChartTable,
+  normalizeName,
+  parseConditionHp,
+  estHp,
+  estimateDamage,
+  FORMATS,
+  formatNeedsTeam,
+} from "./protocol.js";
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
-const RANDOM_FORMATS = [
-  ["gen9randombattle", "Gen 9 Random Battle"],
-  ["gen9hackmonscup", "Gen 9 Hackmons Cup"],
-  ["gen8randombattle", "Gen 8 Random Battle"],
-];
+// Move target categories that need an explicit target in doubles.
+const TARGETABLE = ["normal", "any", "adjacentAlly", "adjacentAllyOrSelf", "adjacentFoe"];
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -27,29 +34,32 @@ function page(title, body, refresh = 0) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-${refreshTag}
+ ${refreshTag}
 <title>${esc(title)}</title>
 <style>
 body{font-family:sans-serif;font-size:14px;margin:8px;background:#111;color:#eee}
 a{color:#7ec3ff}
 h1{font-size:18px;margin:4px 0}
 h2{font-size:15px;margin:12px 0 4px}
+h3{font-size:14px;margin:10px 0 4px}
 .muted{color:#999;font-size:12px}
 .chip{display:inline-block;border:1px solid #555;border-radius:4px;padding:0 4px;margin:0 4px 2px 0;font-size:12px}
+.chip.dmg{border-color:#3a7d44;color:#9be79b}
 code{background:#222;padding:1px 4px;border-radius:3px;font-size:13px}
 .hpbar{font-weight:bold}
 a.row{display:block;border:1px solid #444;border-radius:6px;padding:6px;margin:6px 0;text-decoration:none;background:#1c1c22;color:#eee}
 a.row img{display:block;margin:0 auto 4px}
 .log{font-size:13px;border:1px solid #333;border-radius:6px;padding:6px}
 .banner{background:#2a2510;border:1px solid #775500;padding:6px;border-radius:4px;margin:6px 0;font-size:12px}
-input[type=text],input[type=password],select{font-size:16px;width:92%}
+input[type=text],input[type=password],select,textarea{font-size:16px;width:92%}
 input[type=submit]{font-size:16px}
 form{margin:6px 0}
 hr{border:0;border-top:1px solid #333;margin:10px 0}
+.sub{margin:2px 0 2px 14px;font-size:13px}
 </style>
 </head>
 <body>
-${body}
+ ${body}
 </body>
 </html>`;
 }
@@ -67,6 +77,18 @@ function hpBar(cond) {
   const status = m[3] ? ` [${esc(m[3])}]` : "";
   const color = pct > 50 ? "#4caf50" : pct > 20 ? "#cc7700" : "#bb2222";
   return `<span class="hpbar" style="color:${color}">${pct}%${status}</span>`;
+}
+
+function condPct(cond) {
+  if (cond === "0 fnt") return "fainted";
+  const hp = parseConditionHp(cond);
+  if (!hp || !hp.max) return "";
+  return `${Math.max(0, Math.min(100, Math.round((hp.cur / hp.max) * 100)))}%`;
+}
+
+function statusFromCondition(cond) {
+  const parts = String(cond || "").split(" ");
+  return parts[1] && parts[1] !== "fnt" ? parts[1] : "";
 }
 
 const BOOST_LABELS = {
@@ -98,6 +120,12 @@ function activeForSide(state, which) {
     .map(([, info]) => info);
 }
 
+function identName(ident) {
+  const s = String(ident || "");
+  const i = s.indexOf(": ");
+  return i === -1 ? s : s.slice(i + 2);
+}
+
 function statsLine(stats) {
   if (!stats) return null;
   return `${stats.atk}/${stats.def}/${stats.spa}/${stats.spd}/${stats.spe}`;
@@ -122,14 +150,93 @@ const WEATHER_NAMES = {
   PrimordialSea: "Heavy Rain", DeltaStream: "Strong Winds",
 };
 
+function dexEntry(state, speciesName) {
+  const dex = state.dexData || {};
+  return dex[normalizeName(speciesName)] || null;
+}
+
+// Locate the Mega forme of a species in the fetched dex, if any.
+function megaFormeEntry(state, speciesName) {
+  const dex = state.dexData || {};
+  const base = dex[normalizeName(speciesName)];
+  if (!base || !Array.isArray(base.otherFormes)) return null;
+  const baseId = normalizeName(speciesName);
+  const forme = base.otherFormes.find((f) => String(f).startsWith(baseId + "mega"));
+  return forme ? (dex[forme] || null) : null;
+}
+
+// The "~a-b%" chip. atkMon/defMon are state.active entries; opts.teraType and
+// opts.megaForme adjust the attacker for the +Tera / +Mega variants.
+function damageChipHtml(state, move, atkMon, defMon, opts = {}) {
+  if (!move || move.category === "Status") return "";
+  if (!atkMon || !defMon || defMon.condition === "0 fnt") return "";
+  const atkEntry = dexEntry(state, atkMon.species);
+  const defEntry = dexEntry(state, defMon.species);
+  if (!atkEntry?.baseStats || !defEntry?.baseStats) return "";
+
+  let types = atkMon.types || [];
+  let baseStats = atkEntry.baseStats;
+  if (opts.megaForme) {
+    types = opts.megaForme.types || types;
+    baseStats = opts.megaForme.baseStats || baseStats;
+  }
+  const defMax =
+    parseConditionHp(defMon.condition)?.max ||
+    estHp(defEntry.baseStats.hp, defMon.level || 100);
+
+  const est = estimateDamage(move, {
+    level: atkMon.level || 100,
+    baseStats,
+    types,
+    boosts: atkMon.boosts || {},
+    status: statusFromCondition(atkMon.condition),
+    teraType: opts.teraType || null,
+  }, {
+    level: defMon.level || 100,
+    baseStats: defEntry.baseStats,
+    types: defMon.types || [],
+    boosts: defMon.boosts || {},
+    maxHp: defMax,
+  });
+  if (!est) return "";
+  if (est.eff === 0) return `<span class="chip dmg">x0</span>`;
+  return `<span class="chip dmg">~${est.min}-${est.max}%${est.rough ? " \u2248" : ""}</span>`;
+}
+
+// Choice target locations, relative to the choosing player.
+// -1/-2 = foe slots A/B, 1/2 = your slots A/B, 0 = self.
+function targetLocsFor(moveTarget, slotIdx) {
+  const foe = [["-1", "Foe A"], ["-2", "Foe B"]];
+  const ally = [["1", "Ally A"], ["2", "Ally B"]];
+  switch (moveTarget) {
+    case "adjacentAlly":
+      return slotIdx === 0 ? [["2", "Ally B"]] : [["1", "Ally A"]];
+    case "adjacentAllyOrSelf":
+      return slotIdx === 0 ? [["0", "Self"], ["2", "Ally B"]] : [["1", "Ally A"], ["0", "Self"]];
+    case "any":
+      return [...foe, ...ally];
+    case "normal":
+    case "adjacentFoe":
+    default:
+      return foe;
+  }
+}
+
+function monTargetLabel(mon, fallback) {
+  if (!mon || mon.condition === "0 fnt") return null;
+  const name = (mon.species || mon.nickname || fallback || "?").slice(0, 16);
+  const pct = condPct(mon.condition);
+  return pct ? `${name} ${pct}` : name;
+}
+
 function renderActive(state, which) {
   const mons = activeForSide(state, which);
   if (!mons.length) return `<div class="muted">?</div>`;
 
-  const myActiveFull =
+  const myFulls =
     which === "my"
-      ? (state.request?.side?.pokemon || []).find((p) => p.active)
-      : null;
+      ? (state.request?.side?.pokemon || []).filter((p) => p.active)
+      : [];
 
   return mons
     .map((info) => {
@@ -152,6 +259,8 @@ function renderActive(state, which) {
 
       let intel = "";
       if (which === "my") {
+        const myActiveFull =
+          myFulls.find((p) => identName(p.ident) === info.nickname) || myFulls[0] || null;
         if (myActiveFull?.stats) {
           intel += `<div class="muted">Atk/Def/SpA/SpD/Spe: ${esc(statsLine(myActiveFull.stats))}</div>`;
         }
@@ -379,13 +488,21 @@ function renderChallenges(state) {
     )}...</div>`;
     body += `<div><a href="/cancelchallenge">Cancel challenge</a></div>`;
   } else {
+    const teams = (state.teamView && state.teamView.list) || [];
+    const teamSelect = teams.length
+      ? `<div><label>Your team (used for team formats like Gen 9 OU)<br><select name="team"><option value="">Auto (last used)</option>${teams
+          .map((t, i) => `<option value="${i}">${esc(t.name)}</option>`)
+          .join("")}</select></label></div>`
+      : "";
     body += `<form method="post" action="/challenge">
 <div><label>Friend's username<br><input type="text" name="username"></label></div>
-<div><label>Format<br><select name="format">${RANDOM_FORMATS.map(
+<div><label>Format<br><select name="format">${FORMATS.map(
       ([id, label]) => `<option value="${esc(id)}">${esc(label)}</option>`
     ).join("")}</select></label></div>
+ ${teamSelect}
 <div><input type="submit" value="Challenge"></div>
-</form>`;
+</form>
+<p class="muted">Team formats (Gen 9 OU) use the team selected here, or the last team you used. Upload teams on the Teams page.</p>`;
   }
 
   return body;
@@ -406,6 +523,195 @@ function renderIpLockBanner(state) {
 </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Battle choice UI. Supports singles and doubles. In doubles, picks are made
+// slot by slot: the first pick is stored in the page URL (?part=...) and the
+// final pick submits the joined choice to /choose.
+// ---------------------------------------------------------------------------
+function renderChoices(state, pendingPart) {
+  const req = state.request;
+  if (!req) return "";
+  const myMons = activeForSide(state, "my");
+  const oppMons = activeForSide(state, "opp");
+
+  if (req.teamPreview) {
+    let body = `<h2>Choose lead</h2>`;
+    body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
+    (req.side?.pokemon || []).forEach((p, i) => {
+      body += switchCard(p, i, `/lead?i=${i + 1}`, true);
+    });
+    body += `<p><a href="/lead?i=1">Auto lead first</a></p>`;
+    return body;
+  }
+
+  if (req.forceSwitch) {
+    const forced = req.forceSwitch
+      .map((f, i) => (f ? i : -1))
+      .filter((i) => i >= 0);
+    const total = forced.length;
+    const pending = String(pendingPart || "").split(",").filter(Boolean).slice(0, total);
+    const idx = pending.length;
+
+    let body = `<h2>${total > 1 ? `Choose replacements (${pending.length}/${total} picked)` : "Choose a Pokemon to send out"}</h2>`;
+    body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
+    if (total > 1 && pending.length) {
+      body += `<div class="muted">Picked so far: ${pending.map(esc).join(" | ")}</div>`;
+    }
+    if (idx >= total) {
+      body += `<p><a href="/battle">Refresh</a></p>`;
+      return body;
+    }
+    const party = req.side?.pokemon || [];
+    party.forEach((p, i) => {
+      if (p.active || p.condition === "0 fnt") return;
+      const picks = [...pending, `switch ${i + 1}`];
+      let href;
+      if (picks.length < total) {
+        href = `/battle?part=${encodeURIComponent(picks.join(","))}`;
+      } else {
+        // Fill non-forced slots with "pass" and submit.
+        const full = [];
+        let k = 0;
+        for (let s = 0; s < req.forceSwitch.length; s++) {
+          full.push(req.forceSwitch[s] ? picks[k++] : "pass");
+        }
+        href = `/choose?value=${encodeURIComponent(full.join(","))}`;
+      }
+      body += switchCard(p, i, href, true);
+    });
+    return body;
+  }
+
+  if (req.active) {
+    const n = req.active.length;
+    const doubles = n > 1;
+    const pending = String(pendingPart || "").split(",").filter(Boolean).slice(0, n);
+    const slotIdx = pending.length;
+    if (slotIdx >= n) return `<p><a href="/battle">Refresh</a></p>`;
+
+    let body = "";
+    if (doubles) {
+      body += `<div class="banner">Doubles - picking for slot ${slotIdx + 1} of ${n}.${
+        pending.length ? ` Picked: ${pending.map(esc).join(" | ")}` : ""
+      }</div>`;
+    }
+
+    const activeReq = req.active[slotIdx] || {};
+    const moves = activeReq.moves || [];
+    const canTera = activeReq.canTerastallize;
+    const canMega = activeReq.canMegaEvo;
+    const myMon = myMons[slotIdx] || null;
+    const aliveFoe = oppMons.find((m) => m.condition !== "0 fnt") || oppMons[0] || null;
+
+    const makeHref = (choice) => {
+      const picks = [...pending, choice];
+      if (picks.length >= n) {
+        return `/choose?value=${encodeURIComponent(picks.join(","))}`;
+      }
+      return `/battle?part=${encodeURIComponent(picks.join(","))}`;
+    };
+    const defFor = (loc) => {
+      const l = Number(loc);
+      if (l <= 0) return oppMons[-l - 1] || aliveFoe;
+      return null; // ally/self targets: no damage chip
+    };
+    const targetLinks = (m, keyword, chipOpts) => {
+      const locs = targetLocsFor(m.target || "normal", slotIdx).filter(([loc]) => {
+        const l = Number(loc);
+        if (l < 0) {
+          const foe = oppMons[-l - 1];
+          return foe && foe.condition !== "0 fnt";
+        }
+        return true;
+      });
+      let html = "";
+      for (const [loc, baseLabel] of locs) {
+        const d = defFor(loc);
+        const monLabel = monTargetLabel(d, baseLabel.replace(/[AB]$/, ""));
+        const chip = d && Number(loc) < 0 ? damageChipHtml(state, m, myMon, d, chipOpts) : "";
+        const choice = `move ${moves.indexOf(m) + 1} ${loc}${keyword ? ` ${keyword}` : ""}`;
+        const label = monLabel || baseLabel;
+        html += `<p class="sub"><a href="${esc(makeHref(choice))}">&rarr; ${esc(label)}${chip ? ` ${chip}` : ""}</a></p>`;
+      }
+      return html;
+    };
+
+    body += `<h2>${doubles ? `Slot ${slotIdx + 1}: ` : ""}Choose a move</h2>`;
+    if (!doubles) {
+      body += `<div class="muted">The xN chip is type effectiveness vs the opponent's current type. The ~a-b% chip is an estimated damage range (31 IVs / ~85 EVs assumed, no items/abilities/weather; \u2248 marks rough guesses).</div>`;
+    }
+    moves.forEach((m, i) => {
+      const typeStr = m.type ? ` [${esc(m.type)}]` : "";
+      if (m.disabled || (m.pp ?? 1) <= 0) {
+        body += `<div>${i + 1}. ${esc(m.move)}${typeStr} (unusable)</div>`;
+        body += renderMoveDesc(m);
+        return;
+      }
+      const needsTarget = doubles && TARGETABLE.includes(m.target || "normal");
+      if (needsTarget) {
+        body += `<div>${i + 1}. ${esc(m.move)}${typeStr}</div>`;
+        body += targetLinks(m, "", null);
+      } else {
+        const href = makeHref(`move ${i + 1}`);
+        const effChip =
+          m.oppMult !== undefined && m.oppMult !== null
+            ? ` <span class="chip">${multShort(m.oppMult)}</span>`
+            : "";
+        const chip = damageChipHtml(state, m, myMon, aliveFoe);
+        body += `<p><a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr}${effChip} ${chip} <span class="muted">(${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</span></a></p>`;
+      }
+      body += renderMoveDesc(m);
+    });
+    body += `<p><a href="/choose?value=${encodeURIComponent("default")}">Use default move</a></p>`;
+
+    if (canMega) {
+      body += `<h3>${doubles ? `Slot ${slotIdx + 1}: ` : ""}Mega Evolve</h3>`;
+      body += `<div class="muted">Use a move AND Mega Evolve this turn. Mega stats/types are included in the ~%.</div>`;
+      const megaEntry = myMon ? megaFormeEntry(state, myMon.species) : null;
+      moves.forEach((m, i) => {
+        if (m.disabled || (m.pp ?? 1) <= 0) return;
+        const needsTarget = doubles && TARGETABLE.includes(m.target || "normal");
+        if (needsTarget) {
+          body += targetLinks(m, "mega", { megaForme: megaEntry });
+        } else {
+          const chip = damageChipHtml(state, m, myMon, aliveFoe, { megaForme: megaEntry });
+          body += `<p><a href="${esc(makeHref(`move ${i + 1} mega`))}">${i + 1}. ${esc(m.move)} + Mega ${chip}</a></p>`;
+        }
+      });
+    }
+
+    if (canTera) {
+      body += `<h3>${doubles ? `Slot ${slotIdx + 1}: ` : ""}Terastallize (${esc(String(canTera))})</h3>`;
+      body += `<div class="muted">Use a move AND Terastallize this turn. Tera STAB is included in the ~%.</div>`;
+      moves.forEach((m, i) => {
+        if (m.disabled || (m.pp ?? 1) <= 0) return;
+        const needsTarget = doubles && TARGETABLE.includes(m.target || "normal");
+        if (needsTarget) {
+          body += targetLinks(m, "terastallize", { teraType: String(canTera) });
+        } else {
+          const chip = damageChipHtml(state, m, myMon, aliveFoe, { teraType: String(canTera) });
+          body += `<p><a href="${esc(makeHref(`move ${i + 1} terastallize`))}">${i + 1}. ${esc(m.move)} + Tera ${chip}</a></p>`;
+        }
+      });
+    }
+
+    if (doubles && slotIdx === 0) {
+      body += `<p><a href="${esc(makeHref("shift"))}">Shift (swap to the back slot)</a></p>`;
+    }
+
+    body += `<h3>Switch out${doubles ? ` (slot ${slotIdx + 1})` : ""}</h3>`;
+    if (!doubles) body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
+    (req.side?.pokemon || []).forEach((p, i) => {
+      if (p.active || p.condition === "0 fnt") return;
+      body += switchCard(p, i, makeHref(`switch ${i + 1}`), !doubles);
+    });
+
+    return body;
+  }
+
+  return `<p>Waiting on the other player...</p>`;
+}
+
 export function renderHome(state) {
   let body = `<h1>PS CloudPhone</h1>`;
 
@@ -422,7 +728,7 @@ export function renderHome(state) {
   if (state.notice) body += `<p>${esc(state.notice)}</p>`;
   if (state.loginError) body += `<p style="color:#b22">Login error: ${esc(state.loginError)}</p>`;
 
-  body += `<p><a href="/">Refresh</a> | <a href="/typechart">Type Chart</a> | <a href="/commands">Commands</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
+  body += `<p><a href="/">Refresh</a> | <a href="/teams">Teams</a> | <a href="/typechart">Type Chart</a> | <a href="/commands">Commands</a> | <a href="/dex">Pok&eacute;dex</a> | <a href="/debug">Debug</a> | <a href="/login">Login</a> | <a href="/logout">Logout</a> | <a href="/reconnect">Reconnect</a></p>`;
 
   if (state.roomId && !state.ended) {
     body += `<p><strong><a href="/battle">&gt; Resume battle in progress</a></strong></p>`;
@@ -435,12 +741,14 @@ export function renderHome(state) {
     body += `<div>${esc(state.searching.join(", "))}</div>`;
     body += `<p><a href="/">Check again</a> | <a href="/cancelsearch">Cancel search</a></p>`;
   } else {
-    body += `<h2>Random battles</h2>`;
-    for (const [id, label] of RANDOM_FORMATS) {
-      const href = `/search?format=${encodeURIComponent(id)}`;
-      body += `<div><a href="${esc(href)}">${esc(label)}</a></div>`;
+    body += `<h2>Battle formats</h2>`;
+    for (const [id, label] of FORMATS) {
+      const suffix = formatNeedsTeam(id)
+        ? ` <span class="muted">(needs a team)</span>`
+        : "";
+      body += `<div><a href="/search?format=${encodeURIComponent(id)}">${esc(label)}</a>${suffix}</div>`;
     }
-    body += `<p class="muted">Random formats pick a team for you - no team builder needed.</p>`;
+    body += `<p class="muted">Random formats pick a team for you. Gen 9 OU uses a team you upload on the Teams page (per logged-in account).</p>`;
   }
 
   if (state.ended && state.resultMsg) {
@@ -472,9 +780,11 @@ export function renderLogin(state) {
   return page("Login", body, 0);
 }
 
-export function renderBattle(state) {
+export function renderBattle(state, pendingPart = "") {
   let body = `<h1>${esc(state.roomTitle || "Battle")}</h1>`;
-  body += `<div>Turn ${state.turn || 0}${state.ended ? " - battle over" : ""}</div>`;
+  body += `<div>Turn ${state.turn || 0}${
+    state.gameType === "doubles" ? " (Doubles)" : ""
+  }${state.ended ? " - battle over" : ""}</div>`;
   body += `<div>Timer: <strong>${state.timerOn ? "ON" : "OFF"}</strong></div>`;
 
   body += renderIpLockBanner(state);
@@ -508,74 +818,7 @@ export function renderBattle(state) {
   const req = state.request;
 
   if (req) {
-    if (req.teamPreview) {
-      body += `<h2>Choose lead</h2>`;
-      body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
-      (req.side?.pokemon || []).forEach((p, i) => {
-        body += switchCard(p, i, `/lead?i=${i + 1}`, true);
-      });
-      body += `<p><a href="/lead?i=1">Auto lead first</a></p>`;
-    } else if (req.forceSwitch) {
-      body += `<h2>Choose a Pokemon to send out</h2>`;
-      body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
-      (req.side?.pokemon || []).forEach((p, i) => {
-        if (p.active || p.condition === "0 fnt") return;
-        body += switchCard(
-          p, i,
-          `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`,
-          true
-        );
-      });
-    } else if (req.active) {
-      if (req.active.length > 1) {
-        body += `<div class="muted">Doubles: this UI picks for the first active slot, or use default.</div>`;
-      }
-
-      const activeReq = req.active[0] || {};
-      const moves = activeReq.moves || [];
-      const canTera = activeReq.canTerastallize;
-
-      body += `<h2>Choose a move</h2>`;
-      body += `<div class="muted">The xN chip is type effectiveness vs the opponent's current type.</div>`;
-      moves.forEach((m, i) => {
-        const typeStr = m.type ? ` [${esc(m.type)}]` : "";
-        const effChip =
-          m.oppMult !== undefined && m.oppMult !== null
-            ? ` <span class="chip">${multShort(m.oppMult)}</span>`
-            : "";
-        if (m.disabled) {
-          body += `<div>${i + 1}. ${esc(m.move)}${typeStr} (disabled)</div>`;
-        } else {
-          const href = `/choose?value=${encodeURIComponent(`move ${i + 1}`)}`;
-          body += `<p><a href="${esc(href)}">${i + 1}. ${esc(m.move)}${typeStr}${effChip} <span class="muted">(${m.pp ?? "?"}/${m.maxpp ?? "?"} pp)</span></a></p>`;
-        }
-        body += renderMoveDesc(m);
-      });
-      body += `<p><a href="/choose?value=${encodeURIComponent("default")}">Use default move</a></p>`;
-
-      if (canTera) {
-        body += `<h2>Terastallize (${esc(String(canTera))})</h2>`;
-        body += `<div class="muted">Use a move AND Terastallize this turn.</div>`;
-        moves.forEach((m, i) => {
-          if (m.disabled) return;
-          const href = `/choose?value=${encodeURIComponent(`move ${i + 1} terastallize`)}`;
-          body += `<p><a href="${esc(href)}">${i + 1}. ${esc(m.move)} + Tera</a></p>`;
-        });
-      }
-
-      body += `<h2>Switch out</h2>`;
-      body += `<div class="muted">Stats shown as Atk/Def/SpA/SpD/Spe.</div>`;
-      (req.side?.pokemon || []).forEach((p, i) => {
-        if (p.active || p.condition === "0 fnt") return;
-        body += switchCard(
-          p, i,
-          `/choose?value=${encodeURIComponent(`switch ${i + 1}`)}`,
-          false
-        );
-      });
-    } else {
-      body += `<p>Waiting on the other player...</p>`;
-    }
+    body += renderChoices(state, pendingPart);
   } else {
     body += `<p>Waiting for the next request from the server...</p>`;
   }
@@ -587,6 +830,44 @@ export function renderBattle(state) {
   const refresh = state.request ? 0 : 7;
 
   return page(state.roomTitle || "Battle", body, refresh);
+}
+
+export function renderTeams(state) {
+  const view = state.teamView || { list: [], next: "" };
+  let body = `<h1>My Teams</h1>`;
+
+  if (state.teamError) {
+    body += `<div class="banner" style="background:#2a1010;border-color:#772222">${esc(state.teamError)}</div>`;
+  }
+  if (!state.loginName) {
+    body += `<p class="muted">Log in first - teams are stored per account.</p>`;
+  }
+  if (view.next) {
+    body += `<p>Pick a team for <strong>${esc(view.next)}</strong>:</p>`;
+  }
+
+  if (!view.list.length) {
+    body += `<p class="muted">No teams stored yet for this account.</p>`;
+  }
+  view.list.forEach((t, i) => {
+    body += `<div><strong>${esc(t.name)}</strong> <span class="muted">(${esc(String(t.count))} Pokemon)</span><br>
+<span class="muted">${esc(t.summary || "")}</span><br>`;
+    if (view.next) {
+      body += `<a href="/search?format=${encodeURIComponent(view.next)}&team=${i}">Battle with this team</a> | `;
+    }
+    body += `<a href="/team/delete?id=${i}">Delete</a></div><hr>`;
+  });
+
+  body += `<h2>Upload a team</h2>`;
+  body += `<form method="post" action="/teams/upload${view.next ? `?next=${encodeURIComponent(view.next)}` : ""}">
+<div><label>Team name<br><input type="text" name="name" maxlength="40"></label></div>
+<div><label>Team export<br><textarea name="teamtext" rows="10"></textarea></label></div>
+<div><input type="submit" value="Save team"></div>
+</form>`;
+  body += `<p class="muted">Paste a team in Pokemon Showdown export format (open the teambuilder on a PC browser, load your team, hit Export). Up to 12 teams per account, 6 Pokemon each. Gen 9 OU needs one. Tera type isn't packed yet - in battle the game defaults it to the Pokemon's first type.</p>`;
+  body += `<p><a href="/">Home</a></p>`;
+
+  return page("My Teams", body);
 }
 
 export function renderMoveInfo(move, moveId, state) {
@@ -620,6 +901,12 @@ export function renderMoveInfo(move, moveId, state) {
       body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: <strong>${esc(
         describeMultiplier(mult)
       )}</strong></p>`;
+      // Approximate damage vs the opponent's first active, using my first active.
+      const myInfo = state ? activeForSide(state, "my")[0] : null;
+      const chip = damageChipHtml(state, move, myInfo, oppInfo);
+      if (chip) {
+        body += `<p>Estimated damage from ${esc(myInfo?.species || "your active Pokemon")}: ${chip}</p>`;
+      }
     }
   }
 
@@ -758,6 +1045,7 @@ export function renderDebug(state, extra) {
   body += `Auto-login Disabled (relogDisabled): ${extra.relogDisabled}\n`;
   body += `Room ID: ${state.roomId || "none"}\n`;
   body += `Searching: ${JSON.stringify(state.searching || [])}\n`;
+  body += `Game Type: ${state.gameType || "singles?"}\n`;
   body += `Timer: ${state.timerOn ? "ON" : "OFF"}\n`;
   body += `Notice: ${state.notice || "none"}\n`;
   body += `Login Error: ${state.loginError || "none"}\n`;

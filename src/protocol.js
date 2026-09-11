@@ -79,6 +79,22 @@ export function spriteUrl(species, { shiny = false, back = false, anim = false }
   return `/sprite/${folder}/${file}.${ext}`;
 }
 
+// ---------------------------------------------------------------------------
+// Formats - single source of truth. Edit ids here if your upstream sim uses
+// different ids for the Champions formats.
+// ---------------------------------------------------------------------------
+export const FORMATS = [
+  ["gen9randombattle", "Gen 9 Random Battle"],
+  ["gen9championsrandombattle", "Gen 9 Champions Random Battle"],
+  ["gen9randomdoublesbattle", "Gen 9 Random Doubles Battle"],
+  ["gen9championsrandomdoublesbattle", "Gen 9 Champions Random Doubles Battle"],
+  ["gen9ou", "Gen 9 OU"],
+];
+
+export function formatNeedsTeam(id) {
+  return !String(id || "").includes("random");
+}
+
 export const TYPE_CHART = {
   Normal: { Rock: 0.5, Ghost: 0, Steel: 0.5 },
   Fire: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 2, Bug: 2, Rock: 0.5, Dragon: 0.5, Steel: 2 },
@@ -113,10 +129,6 @@ export function typeEffectiveness(moveType, defenderTypes) {
 
 export const ALL_TYPES = Object.keys(TYPE_CHART);
 
-// Beginner-friendly reference table: for each single type, which attacking
-// types are super effective against it (weakTo), resisted by it (resists),
-// or have no effect on it (immuneTo). Computed from TYPE_CHART, which is
-// keyed by [attackingType][defendingType].
 export function typeChartTable() {
   return ALL_TYPES.map((defType) => {
     const weakTo = [];
@@ -131,6 +143,101 @@ export function typeChartTable() {
     }
     return { type: defType, weakTo, resists, immuneTo };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Approximate damage estimation. Assumes 31 IVs, ~85 EVs everywhere, neutral
+// nature, no items/abilities/weather/screens/crits. Includes type chart,
+// STAB, Tera STAB, stat boosts, burn, multi-hit average, and fixed-damage
+// moves. Everything shown to the user carries a "~" so nobody mistakes it
+// for exact math.
+// ---------------------------------------------------------------------------
+const EST_IV = 31;
+const EST_EV = 85;
+
+export function estStat(base, level) {
+  base = Number(base) || 0;
+  level = Number(level) || 100;
+  return Math.floor(((2 * base + EST_IV + Math.floor(EST_EV / 4)) * level) / 100) + 5;
+}
+
+export function estHp(base, level) {
+  base = Number(base) || 0;
+  level = Number(level) || 100;
+  return Math.floor(((2 * base + EST_IV + Math.floor(EST_EV / 4)) * level) / 100) + level + 10;
+}
+
+export function boostMultiplier(stage) {
+  const n = Math.max(-6, Math.min(6, Number(stage) || 0));
+  return n >= 0 ? (2 + n) / 2 : 2 / (2 - n);
+}
+
+export function parseConditionHp(cond) {
+  const m = String(cond || "").match(/^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  return { cur: Number(m[1]), max: Number(m[2]) };
+}
+
+// move: { type, category, basePower, multihit, damage } (enriched from moves.json)
+// atk:  { level, baseStats, types, boosts, status, teraType }
+// def:  { level, baseStats, types, boosts, maxHp }
+// Returns { min, max, eff, rough } as damage percent, or null.
+export function estimateDamage(move, atk, def) {
+  if (!move || !atk || !def) return null;
+  if (move.category === "Status") return null;
+  const eff = typeEffectiveness(move.type, def.types);
+  if (eff === 0) return { min: 0, max: 0, eff, rough: false };
+
+  const level = Number(atk.level) || 100;
+  let rough = false;
+  let dmg;
+  if (move.damage === "level") {
+    dmg = level;
+  } else if (typeof move.damage === "number") {
+    dmg = move.damage;
+  } else {
+    let bp = Number(move.basePower) || 0;
+    if (!bp) {
+      bp = 60; // situational BP (Gyro Ball, Grass Knot, Return...) - rough guess
+      rough = true;
+    }
+    const phys = move.category === "Physical";
+    const aStat = phys ? "atk" : "spa";
+    const dStat = phys ? "def" : "spd";
+    const aBase = atk.baseStats ? atk.baseStats[aStat] : 100;
+    const dBase = def.baseStats ? def.baseStats[dStat] : 100;
+    let A = estStat(aBase, level) * boostMultiplier((atk.boosts || {})[aStat]);
+    if (phys && atk.status === "brn") A *= 0.5;
+    const D = estStat(dBase, Number(def.level) || 100) * boostMultiplier((def.boosts || {})[dStat]);
+    if (D <= 0 || A <= 0) return null;
+    dmg = Math.floor(Math.floor(Math.floor(((2 * level) / 5 + 2) * bp * A / D) / 50) + 2);
+    if (move.multihit) {
+      if (Array.isArray(move.multihit)) {
+        dmg *= 3; // average of 2-5 (or 1-3) hit ranges
+        rough = true;
+      } else {
+        dmg *= Number(move.multihit) || 1;
+      }
+    }
+  }
+
+  let stab = 1;
+  if (atk.teraType && normalizeName(atk.teraType) === normalizeName(move.type)) stab = 2;
+  else if ((atk.types || []).includes(move.type)) stab = 1.5;
+  const mid = Math.floor(Math.floor(dmg * stab) * eff);
+
+  let maxHp = Number(def.maxHp) || 0;
+  if (!maxHp && def.baseStats) maxHp = estHp(def.baseStats.hp, def.level || 100);
+  if (!maxHp) return null;
+
+  const lo = Math.max(1, Math.floor(mid * 0.85));
+  const hi = Math.max(lo, mid);
+  return {
+    min: Math.min(100, Math.round((lo * 100) / maxHp)),
+    max: Math.min(100, Math.round((hi * 100) / maxHp)),
+    eff,
+    rough,
+  };
 }
 
 function stripRank(user) {
@@ -314,6 +421,10 @@ export function formatBattleLine(type, parts, mySide = null) {
     case "-enditem": {
       const p = parseIdent(parts[0]);
       return `${p.name}'s ${parts[1]} was used up.`;
+    }
+    case "-mega": {
+      const p = parseIdent(parts[0]);
+      return `${p.name} Mega Evolved!`;
     }
     case "-terastallize": {
       const p = parseIdent(parts[0]);
