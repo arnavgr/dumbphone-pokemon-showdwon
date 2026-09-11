@@ -159,18 +159,12 @@ async function getItems() {
   return itemsPromise;
 }
 
-function decodeHtmlEntities(str) {
-  return String(str || "")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&nbsp;/g, " ");
-}
-
 // ---------------------------------------------------------------------------
-// Team import helpers: support both export text and packed string formats.
+// Team import: parse a Showdown-exported team (teambuilder "Export" text),
+// validate it against the fetched dex/moves/items, and produce the packed
+// string that /utm expects. Tera type is intentionally not packed - the sim
+// defaults it to the Pokemon's first type, and the battle request tells the
+// player which Tera type is available.
 // ---------------------------------------------------------------------------
 async function importTeam(text) {
   const dex = await getPokedex();
@@ -219,6 +213,7 @@ async function importTeam(text) {
     if ((m = line.match(/^IVs:\s*(.+)$/i))) { if (cur) parseSpread(m[1], cur.ivs); continue; }
     if ((m = line.match(/^([A-Za-z]+)\s+Nature$/i))) { if (cur) cur.nature = m[1].trim(); continue; }
 
+    // Otherwise: a new set header line ("Species @ Item" or "Nick (Species) @ Item")
     const atSplit = line.split("@");
     const head = atSplit[0].trim();
     if (!head) continue;
@@ -227,7 +222,7 @@ async function importTeam(text) {
     let nick = "";
     const paren = head.match(/^(.*)\(([^()]*)\)\s*$/);
     if (paren && /^[MF]$/i.test(paren[2].trim())) {
-      species = paren[1].trim();
+      species = paren[1].trim(); // trailing gender marker, not a nickname
     } else if (paren) {
       nick = paren[1].trim();
       species = paren[2].trim();
@@ -313,154 +308,6 @@ async function importTeam(text) {
   return { packed: packedSets.join("]"), count: sets.length, summary: summary.join(", ") };
 }
 
-async function importPackedTeam(packedStr) {
-  const dex = await getPokedex();
-  const sets = String(packedStr || "").trim().split("]");
-  const summary = [];
-  let count = 0;
-  for (const s of sets) {
-    if (!s.trim()) continue;
-    count++;
-    const parts = s.split("|");
-    const namePart = parts[0] || "";
-    const spId = namePart.includes("|") ? namePart.split("|")[1] : namePart;
-    const entry = dex[normalizeName(spId)];
-    summary.push(entry?.name || spId || "Unknown");
-  }
-  if (!count) throw new Error("No Pokemon found in packed team.");
-  if (count > 6) throw new Error("A team can have at most 6 Pokemon.");
-  return {
-    packed: packedStr.trim(),
-    count,
-    summary: summary.join(", "),
-  };
-}
-
-async function parseAnyTeam(text) {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) throw new Error("Empty team content.");
-  if (!trimmed.includes("\n") && trimmed.includes("|") && (trimmed.includes("]") || trimmed.split("|").length >= 5)) {
-    return importPackedTeam(trimmed);
-  }
-  return importTeam(trimmed);
-}
-
-async function parseMultipleTeams(text) {
-  const raw = String(text || "").trim();
-  const teamDelimiter = /(?:^|\r?\n)===\s*(?:\[([^\]]*)\])?\s*([^=\r\n]+)\s*===/g;
-  const matches = [...raw.matchAll(teamDelimiter)];
-  if (matches.length > 0) {
-    const results = [];
-    for (let i = 0; i < matches.length; i++) {
-      const match = matches[i];
-      const format = (match[1] || "").trim();
-      const name = (match[2] || "").trim();
-      const startIndex = match.index + match[0].length;
-      const endIndex = i + 1 < matches.length ? matches[i + 1].index : raw.length;
-      const teamText = raw.slice(startIndex, endIndex).trim();
-      try {
-        const parsed = await parseAnyTeam(teamText);
-        results.push({
-          name: name || (format ? `${format} Team` : `Team ${results.length + 1}`),
-          packed: parsed.packed,
-          summary: parsed.summary,
-          count: parsed.count,
-          added: Date.now(),
-        });
-      } catch {}
-    }
-    if (results.length > 0) return results;
-  }
-
-  const single = await parseAnyTeam(raw);
-  return [{
-    name: "Imported Team",
-    packed: single.packed,
-    summary: single.summary,
-    count: single.count,
-    added: Date.now(),
-  }];
-}
-
-async function fetchTeamBySlug(slug, nameHint, headers, dispatcher) {
-  let html = "";
-  try {
-    const body = new URLSearchParams();
-    body.set("act", "requestpage");
-    body.set("page", `team-${slug}`);
-    if (headers.assertion) body.set("assertion", headers.assertion);
-    const res = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "User-Agent": "ps-cloudphone",
-        "Origin": "https://play.pokemonshowdown.com",
-        "Referer": "https://play.pokemonshowdown.com/",
-        ...(headers.cookie ? { Cookie: headers.cookie } : {}),
-      },
-      body: body.toString(),
-      dispatcher,
-    });
-    if (res.ok) html = await res.text();
-  } catch {}
-
-  if (!html || (!html.includes("<textarea") && !html.includes("<pre") && !html.includes("/utm") && !html.includes("Ability:"))) {
-    try {
-      const res = await undiciFetch(`https://psim.us/t/${slug}`, {
-        headers: {
-          "User-Agent": "ps-cloudphone",
-          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
-        },
-        dispatcher,
-      });
-      if (res.ok) html = await res.text();
-    } catch {}
-  }
-
-  if (!html) return null;
-
-  let title = nameHint || "";
-  if (!title) {
-    const tm = html.match(/<h[1-4][^>]*>([^<]+)<\/h[1-4]>/i) || html.match(/<title>([^<]+)<\/title>/i);
-    if (tm) {
-      title = tm[1]
-        .replace(/-(?:Pok[eé]mon Showdown|Showdown).*$/i, "")
-        .replace(/\s*\((?:Private|Public)\)/i, "")
-        .trim();
-    }
-  }
-
-  let teamContent = "";
-  const textMatch = html.match(/<(?:textarea|pre|code)[^>]*>([\s\S]*?)<\/(?:textarea|pre|code)>/i);
-  if (textMatch) {
-    teamContent = decodeHtmlEntities(textMatch[1]).trim();
-  } else {
-    const utmMatch = html.match(/value="\/utm\s+([^"]+)"/i) || html.match(/\/utm\s+([a-zA-Z0-9_|\]]+)/i);
-    if (utmMatch) {
-      teamContent = utmMatch[1].trim();
-    }
-  }
-
-  if (!teamContent && (html.includes("Ability:") || html.includes("@"))) {
-    teamContent = cleanRawHtml(html);
-  }
-
-  if (!teamContent) return null;
-
-  try {
-    const parsed = await parseAnyTeam(teamContent);
-    return {
-      name: title || `Team (${slug})`,
-      packed: parsed.packed,
-      summary: parsed.summary,
-      count: parsed.count,
-      added: Date.now(),
-    };
-  } catch {
-    return null;
-  }
-}
-
 function cleanSideCond(s) {
   return String(s || "").replace(/^move:\s*/i, "").trim();
 }
@@ -490,7 +337,6 @@ const DEFAULT_STATE = {
   notice: null,
   loginError: null,
   serverMsg: null,
-  assertion: null,
   upstreamCookie: null,
   challengesFrom: {},
   challengeTo: null,
@@ -607,6 +453,9 @@ export class BattleSession {
       ? [...new Set(Object.values(entry.abilities))]
       : [];
 
+    // If this Pokemon was already revealed earlier in the battle (e.g. it
+    // Terastallized or Mega Evolved before switching out), restore that
+    // instead of resetting to its base dex data.
     const revealedEntry = this.state_.revealed[sideKey(p.side)]?.[id];
     const teraType = revealedEntry?.teraType || null;
     if (teraType) types = [teraType];
@@ -646,6 +495,8 @@ export class BattleSession {
     const sideMap = this.state_.revealed[side] || (this.state_.revealed[side] = {});
     const key = normalizeName(species);
     const existing = sideMap[key];
+    // upsertActive() runs just before this and already resolved the
+    // correct types (including any Tera override), so reuse it here.
     const activeMon = this.state_.active[p.side];
     sideMap[key] = {
       species,
@@ -694,6 +545,8 @@ export class BattleSession {
     }
   }
 
+  // Shared by -formechange and -mega: swap species, retype, re-speed, re-sprite,
+  // and record the forme in the revealed map if it's new.
   async applyFormeChange(side, newSpecies) {
     const mon = this.state_.active[side];
     if (!mon || !newSpecies) return;
@@ -775,21 +628,6 @@ export class BattleSession {
       dispatcher: proxyDispatcher,
     });
 
-    let sidCookie = null;
-    const rawSetCookies = typeof res.headers.getSetCookie === "function"
-      ? res.headers.getSetCookie()
-      : [res.headers.get("set-cookie")].filter(Boolean);
-    for (const c of rawSetCookies) {
-      const m = String(c || "").match(/(sid=[^;]+)/i);
-      if (m) {
-        sidCookie = m[1];
-        break;
-      }
-    }
-    if (sidCookie) {
-      this.state_.upstreamCookie = sidCookie;
-    }
-
     const text = await res.text();
     let jsonText = text.trim();
     if (jsonText.startsWith("]")) jsonText = jsonText.slice(1);
@@ -825,7 +663,6 @@ export class BattleSession {
       return this._doLogin(username, password, true);
     }
 
-    this.state_.assertion = assertion;
     const finalName = action?.username || username;
 
     let confirmResolve;
@@ -865,9 +702,7 @@ export class BattleSession {
       this.state_.loggedIn &&
       this.ws &&
       this.ws.readyState === 1 &&
-      this.state_.username?.toLowerCase() === loginName.toLowerCase() &&
-      this.state_.upstreamCookie &&
-      this.state_.assertion;
+      this.state_.username?.toLowerCase() === loginName.toLowerCase();
 
     if (alreadyIn()) return;
 
@@ -1005,6 +840,8 @@ export class BattleSession {
     }, delay);
   }
 
+  // Resolve which stored team to use for a team format. Returns { team, idx }
+  // or null if none is available.
   pickTeam(format, explicitIdx) {
     const user = normalizeName(this.state_.loginName || "");
     const list = teamsStore[user] || [];
@@ -1021,145 +858,6 @@ export class BattleSession {
       }
     }
     return picked ? { team: picked, idx: pickedIdx } : null;
-  }
-
-async syncTeamsFromServer() {
-    const user = normalizeName(this.state_.loginName || "");
-    if (!user) throw new Error("Log in first to sync server teams.");
-
-    this.pushLog(`[sync] Starting team sync for user: ${user}`);
-    this.pushLog(`[sync] Upstream cookie: ${this.state_.upstreamCookie || "none"}`);
-    this.pushLog(`[sync] Assertion present: ${Boolean(this.state_.assertion)}`);
-
-    const discoveredTeams = [];
-    const headers = {
-      cookie: this.state_.upstreamCookie || "",
-      assertion: this.state_.assertion || "",
-    };
-
-    // 1. Check act=getteams endpoint
-    try {
-      this.pushLog("[sync] Calling act=getteams...");
-      const getRes = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php?act=getteams", {
-        method: "GET",
-        headers: {
-          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
-          "User-Agent": "ps-cloudphone",
-        },
-        dispatcher: proxyDispatcher,
-      });
-
-      this.pushLog(`[sync] getteams status: ${getRes.status}`);
-      const text = (await getRes.text()).trim();
-      this.pushLog(`[sync] getteams body preview: ${text.slice(0, 120)}`);
-
-      if (getRes.ok && text) {
-        let cleanText = text.startsWith("]") ? text.slice(1).trim() : text;
-        try {
-          const data = JSON.parse(cleanText);
-          const teamArr = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : []);
-          for (const item of teamArr) {
-            const teamContent = typeof item === "string" ? item : (item?.team || item?.packed || item?.data || "");
-            if (teamContent) {
-              const parsed = await parseAnyTeam(teamContent);
-              discoveredTeams.push({
-                name: (typeof item === "object" && (item.name || item.title)) || `Server Team ${discoveredTeams.length + 1}`,
-                packed: parsed.packed,
-                summary: parsed.summary,
-                count: parsed.count,
-                added: Date.now(),
-              });
-            }
-          }
-        } catch {
-          const parsedList = await parseMultipleTeams(cleanText);
-          for (const pt of parsedList) discoveredTeams.push(pt);
-        }
-      }
-    } catch (err) {
-      this.pushLog(`[sync] getteams fetch failed: ${err.message || err}`);
-    }
-
-    // 2. Request teams list page room: page=teams-all-
-    let pageResText = "";
-    try {
-      this.pushLog("[sync] Requesting page=teams-all-...");
-      const pageBody = new URLSearchParams();
-      pageBody.set("act", "requestpage");
-      pageBody.set("page", "teams-all-");
-      if (headers.assertion) pageBody.set("assertion", headers.assertion);
-
-      const pageRes = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "User-Agent": "ps-cloudphone",
-          "Origin": "https://play.pokemonshowdown.com",
-          "Referer": "https://play.pokemonshowdown.com/",
-          "X-Requested-With": "XMLHttpRequest",
-          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
-        },
-        body: pageBody.toString(),
-        dispatcher: proxyDispatcher,
-      });
-
-      this.pushLog(`[sync] requestpage status: ${pageRes.status}`);
-      pageResText = await pageRes.text();
-      this.pushLog(`[sync] requestpage body preview: ${pageResText.slice(0, 150)}`);
-    } catch (err) {
-      this.pushLog(`[sync] requestpage fetch failed: ${err.message || err}`);
-    }
-
-    if (pageResText) {
-      const slugMap = new Map();
-      const titledMatches = [
-        ...pageResText.matchAll(/([^<>\n\r]+?)\s*\((?:Private|Public)\)[\s\S]*?(?:psim\.us\/t\/|view-team-)([0-9]+-[a-zA-Z0-9_-]+)/gi)
-      ];
-      for (const tm of titledMatches) {
-        const title = tm[1].trim();
-        const slug = tm[2].trim();
-        if (slug && !slugMap.has(slug)) slugMap.set(slug, title);
-      }
-
-      const standaloneSlugs = [
-        ...pageResText.matchAll(/(?:psim\.us\/t\/|view-team-|\/t\/)([0-9]+-[a-zA-Z0-9_-]+)/gi)
-      ];
-      for (const sm of standaloneSlugs) {
-        const slug = sm[1].trim();
-        if (!slugMap.has(slug)) slugMap.set(slug, "");
-      }
-
-      this.pushLog(`[sync] Slugs detected: ${Array.from(slugMap.keys()).join(", ") || "none"}`);
-
-      for (const [slug, nameHint] of slugMap.entries()) {
-        if (discoveredTeams.length >= 12) break;
-        const fetchedTeam = await fetchTeamBySlug(slug, nameHint, headers, proxyDispatcher);
-        if (fetchedTeam) discoveredTeams.push(fetchedTeam);
-      }
-    }
-
-    this.pushLog(`[sync] Total discovered teams: ${discoveredTeams.length}`);
-
-    if (!discoveredTeams.length) {
-      if (/no teams/i.test(pageResText) || pageResText.includes("0 teams")) {
-        throw new Error("No teams found on Pokémon Showdown server for this account.");
-      }
-      throw new Error("Could not retrieve teams from Pokémon Showdown server. Please ensure you are logged in.");
-    }
-
-    const list = teamsStore[user] || (teamsStore[user] = []);
-    let addedCount = 0;
-    for (const dt of discoveredTeams) {
-      const exists = list.some((existing) => existing.packed === dt.packed);
-      if (!exists) {
-        if (list.length >= 12) break;
-        list.push(dt);
-        addedCount++;
-      }
-    }
-
-    saveTeamsStore();
-    return { count: addedCount, totalFound: discoveredTeams.length };
   }
 
   async handleLine(roomId, rawLine) {
@@ -1324,6 +1022,7 @@ async syncTeamsFromServer() {
 
           const dex = await getPokedex();
           const movesData = await getMoves();
+          // Stash for the server-rendered damage estimates (renderBattle is sync).
           this.state_.dexData = dex;
           this.state_.movesData = movesData;
 
@@ -1370,6 +1069,7 @@ async syncTeamsFromServer() {
                   if (data.type) m.type = data.type;
                   if (data.category) m.category = data.category;
                   if (data.shortDesc || data.desc) m.shortDesc = data.shortDesc || data.desc;
+                  // Extra fields the damage estimator needs.
                   if (Number.isFinite(data.basePower)) m.basePower = data.basePower;
                   if (data.multihit) m.multihit = data.multihit;
                   if (data.damage !== undefined) m.damage = data.damage;
@@ -1708,6 +1408,7 @@ async syncTeamsFromServer() {
 
   async handleRequest(req, res) {
     try {
+      // Auto-hydrate login state from encrypted cookie if memory state was reset by server sleep
       if (!this.state_.loginName && req.cookies?.ps_auth) {
         const creds = decryptCredentials(req.cookies.ps_auth);
         if (creds?.u && creds?.p) {
@@ -1740,6 +1441,7 @@ async syncTeamsFromServer() {
           }
         }
 
+        // Team formats need /utm with a packed team before /search.
         let teamPacked = null;
         if (formatNeedsTeam(format)) {
           const explicitIdx = Number(req.query.team);
@@ -1753,7 +1455,7 @@ async syncTeamsFromServer() {
             return res.redirect("/teams");
           }
           if (Number.isInteger(explicitIdx) && picked.idx === explicitIdx) {
-            this.state_.lastTeam[format] = picked.idx;
+            this.state_.lastTeam[format] = picked.idx; // remember for next time
           }
           teamPacked = picked.team.packed;
         }
@@ -1848,6 +1550,7 @@ async syncTeamsFromServer() {
           if (this.state_.loginName) {
             await this.autoRelogin();
           }
+          // If the incoming challenge is a team format, attach the remembered team.
           const fmt = this.state_.challengesFrom?.[user] || "";
           if (formatNeedsTeam(fmt)) {
             const picked = this.pickTeam(fmt, undefined);
@@ -1932,33 +1635,6 @@ async syncTeamsFromServer() {
         return res.send(html);
       }
 
-      if (path === "/teams/sync") {
-        const user = normalizeName(this.state_.loginName || "");
-        if (!user) {
-          this.state_.notice = "Log in first - teams are stored per account.";
-          return res.redirect("/login");
-        }
-        const next = String(req.query.next || this.state_.teamNext || "");
-        try {
-          if (this.state_.loginName && this.state_.loginPassword && (!this.state_.upstreamCookie || !this.state_.assertion)) {
-            this.relogDisabled = false;
-            await this.login(this.state_.loginName, this.state_.loginPassword);
-          } else if (this.state_.loginName) {
-            await this.autoRelogin();
-          }
-          const resSync = await this.syncTeamsFromServer();
-          if (resSync.count > 0) {
-            this.state_.notice = `Successfully imported ${resSync.count} team(s) from Pokémon Showdown server.`;
-          } else {
-            this.state_.notice = `All ${resSync.totalFound} team(s) on the server are already in your list.`;
-          }
-        } catch (err) {
-          this.state_.teamError = err.message || String(err);
-        }
-        this.state_.teamNext = next || null;
-        return res.redirect("/teams" + (next ? `?next=${encodeURIComponent(next)}` : ""));
-      }
-
       if (path === "/teams/upload" && req.method === "POST") {
         const user = normalizeName(this.state_.loginName || "");
         if (!user) {
@@ -1969,26 +1645,18 @@ async syncTeamsFromServer() {
         const name = String(req.body.name || "").replace(/[<>]/g, "").trim().slice(0, 40);
         const text = String(req.body.teamtext || "");
         try {
-          const parsedList = await parseMultipleTeams(text);
+          const parsed = await importTeam(text);
           const list = teamsStore[user] || (teamsStore[user] = []);
-          let added = 0;
-          for (const item of parsedList) {
-            if (list.length >= 12) break;
-            const teamName = (parsedList.length === 1 && name) ? name : item.name;
-            list.push({
-              name: teamName || `Team ${list.length + 1}`,
-              packed: item.packed,
-              summary: item.summary,
-              count: item.count,
-              added: Date.now(),
-            });
-            added++;
-          }
-          if (added === 0 && parsedList.length > 0) {
-            throw new Error("Team limit reached (12). Delete one first.");
-          }
+          if (list.length >= 12) throw new Error("Team limit reached (12). Delete one first.");
+          list.push({
+            name: name || `Team ${list.length + 1}`,
+            packed: parsed.packed,
+            summary: parsed.summary,
+            count: parsed.count,
+            added: Date.now(),
+          });
           saveTeamsStore();
-          this.state_.notice = added > 1 ? `Saved ${added} teams.` : `Team saved: ${name || parsedList[0]?.name || "Unnamed"}.`;
+          this.state_.notice = `Team saved: ${name || "Unnamed"}.`;
         } catch (err) {
           this.state_.teamError = err.message || String(err);
         }
@@ -2003,6 +1671,7 @@ async syncTeamsFromServer() {
         if (list && Number.isInteger(idx) && idx >= 0 && idx < list.length) {
           list.splice(idx, 1);
           if (!list.length) delete teamsStore[user];
+          // Fix remembered-team indexes so they don't point at the wrong team.
           for (const fmt of Object.keys(this.state_.lastTeam)) {
             const li = this.state_.lastTeam[fmt];
             if (li === idx) delete this.state_.lastTeam[fmt];
@@ -2087,6 +1756,7 @@ async syncTeamsFromServer() {
             this.relogDisabled = false;
             await this.login(username, password);
 
+            // Persist encrypted login credentials across server sleep cycles
             res.cookie("ps_auth", encryptCredentials(username, password), {
               maxAge: 30 * 24 * 60 * 60 * 1000,
               httpOnly: true,
@@ -2115,6 +1785,7 @@ async syncTeamsFromServer() {
         this.relogDisabled = false;
         this.state_.notice = "Logged out.";
 
+        // Clear auth cookie
         res.clearCookie("ps_auth", { path: "/" });
         return res.redirect("/");
       }
@@ -2124,6 +1795,7 @@ async syncTeamsFromServer() {
         return res.send(renderBattle(this.state_, String(req.query.part || "")));
       }
 
+      // Home page needs the team list for the challenge form.
       const homeUser = normalizeName(this.state_.loginName || "");
       this.state_.teamView = { list: teamsStore[homeUser] || [], next: this.state_.teamNext || "" };
       const homeHtml = renderHome(this.state_);
