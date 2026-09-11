@@ -1023,9 +1023,13 @@ export class BattleSession {
     return picked ? { team: picked, idx: pickedIdx } : null;
   }
 
-  async syncTeamsFromServer() {
+async syncTeamsFromServer() {
     const user = normalizeName(this.state_.loginName || "");
     if (!user) throw new Error("Log in first to sync server teams.");
+
+    this.pushLog(`[sync] Starting team sync for user: ${user}`);
+    this.pushLog(`[sync] Upstream cookie: ${this.state_.upstreamCookie || "none"}`);
+    this.pushLog(`[sync] Assertion present: ${Boolean(this.state_.assertion)}`);
 
     const discoveredTeams = [];
     const headers = {
@@ -1035,6 +1039,7 @@ export class BattleSession {
 
     // 1. Check act=getteams endpoint
     try {
+      this.pushLog("[sync] Calling act=getteams...");
       const getRes = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php?act=getteams", {
         method: "GET",
         headers: {
@@ -1044,50 +1049,41 @@ export class BattleSession {
         dispatcher: proxyDispatcher,
       });
 
-      if (getRes.ok) {
-        let text = await getRes.text();
-        if (text) {
-          if (text.startsWith("]")) text = text.slice(1).trim();
-          try {
-            const data = JSON.parse(text);
-            const teamArr = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : []);
-            for (const item of teamArr) {
-              if (typeof item === "string") {
-                const parsed = await parseAnyTeam(item);
-                discoveredTeams.push({
-                  name: `Server Team ${discoveredTeams.length + 1}`,
-                  packed: parsed.packed,
-                  summary: parsed.summary,
-                  count: parsed.count,
-                  added: Date.now(),
-                });
-              } else if (item && typeof item === "object") {
-                const teamContent = item.team || item.packed || item.data || "";
-                if (teamContent) {
-                  const parsed = await parseAnyTeam(teamContent);
-                  discoveredTeams.push({
-                    name: item.name || item.title || `Server Team ${discoveredTeams.length + 1}`,
-                    packed: parsed.packed,
-                    summary: parsed.summary,
-                    count: parsed.count,
-                    added: Date.now(),
-                  });
-                }
-              }
+      this.pushLog(`[sync] getteams status: ${getRes.status}`);
+      const text = (await getRes.text()).trim();
+      this.pushLog(`[sync] getteams body preview: ${text.slice(0, 120)}`);
+
+      if (getRes.ok && text) {
+        let cleanText = text.startsWith("]") ? text.slice(1).trim() : text;
+        try {
+          const data = JSON.parse(cleanText);
+          const teamArr = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : []);
+          for (const item of teamArr) {
+            const teamContent = typeof item === "string" ? item : (item?.team || item?.packed || item?.data || "");
+            if (teamContent) {
+              const parsed = await parseAnyTeam(teamContent);
+              discoveredTeams.push({
+                name: (typeof item === "object" && (item.name || item.title)) || `Server Team ${discoveredTeams.length + 1}`,
+                packed: parsed.packed,
+                summary: parsed.summary,
+                count: parsed.count,
+                added: Date.now(),
+              });
             }
-          } catch {
-            try {
-              const parsedList = await parseMultipleTeams(text);
-              for (const pt of parsedList) discoveredTeams.push(pt);
-            } catch {}
           }
+        } catch {
+          const parsedList = await parseMultipleTeams(cleanText);
+          for (const pt of parsedList) discoveredTeams.push(pt);
         }
       }
-    } catch {}
+    } catch (err) {
+      this.pushLog(`[sync] getteams fetch failed: ${err.message || err}`);
+    }
 
     // 2. Request teams list page room: page=teams-all-
     let pageResText = "";
     try {
+      this.pushLog("[sync] Requesting page=teams-all-...");
       const pageBody = new URLSearchParams();
       pageBody.set("act", "requestpage");
       pageBody.set("page", "teams-all-");
@@ -1107,46 +1103,42 @@ export class BattleSession {
         dispatcher: proxyDispatcher,
       });
 
-      if (pageRes.ok) {
-        pageResText = await pageRes.text();
-      }
-    } catch {}
+      this.pushLog(`[sync] requestpage status: ${pageRes.status}`);
+      pageResText = await pageRes.text();
+      this.pushLog(`[sync] requestpage body preview: ${pageResText.slice(0, 150)}`);
+    } catch (err) {
+      this.pushLog(`[sync] requestpage fetch failed: ${err.message || err}`);
+    }
 
     if (pageResText) {
       const slugMap = new Map();
-
-      // Match title alongside slug: Title (Private)...psim.us/t/slug
       const titledMatches = [
         ...pageResText.matchAll(/([^<>\n\r]+?)\s*\((?:Private|Public)\)[\s\S]*?(?:psim\.us\/t\/|view-team-)([0-9]+-[a-zA-Z0-9_-]+)/gi)
       ];
       for (const tm of titledMatches) {
         const title = tm[1].trim();
         const slug = tm[2].trim();
-        if (slug && !slugMap.has(slug)) {
-          slugMap.set(slug, title);
-        }
+        if (slug && !slugMap.has(slug)) slugMap.set(slug, title);
       }
 
-      // Match standalone slugs
       const standaloneSlugs = [
         ...pageResText.matchAll(/(?:psim\.us\/t\/|view-team-|\/t\/)([0-9]+-[a-zA-Z0-9_-]+)/gi)
       ];
       for (const sm of standaloneSlugs) {
         const slug = sm[1].trim();
-        if (slug && !slugMap.has(slug)) {
-          slugMap.set(slug, "");
-        }
+        if (!slugMap.has(slug)) slugMap.set(slug, "");
       }
 
-      // Fetch each team slug
+      this.pushLog(`[sync] Slugs detected: ${Array.from(slugMap.keys()).join(", ") || "none"}`);
+
       for (const [slug, nameHint] of slugMap.entries()) {
         if (discoveredTeams.length >= 12) break;
         const fetchedTeam = await fetchTeamBySlug(slug, nameHint, headers, proxyDispatcher);
-        if (fetchedTeam) {
-          discoveredTeams.push(fetchedTeam);
-        }
+        if (fetchedTeam) discoveredTeams.push(fetchedTeam);
       }
     }
+
+    this.pushLog(`[sync] Total discovered teams: ${discoveredTeams.length}`);
 
     if (!discoveredTeams.length) {
       if (/no teams/i.test(pageResText) || pageResText.includes("0 teams")) {
