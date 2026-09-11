@@ -12,7 +12,6 @@ import {
 
 const SHOW_BACK_SPRITES_FOR_YOU = true;
 
-// Move target categories that need an explicit target in doubles.
 const TARGETABLE = ["normal", "any", "adjacentAlly", "adjacentAllyOrSelf", "adjacentFoe"];
 
 function esc(s) {
@@ -155,7 +154,6 @@ function dexEntry(state, speciesName) {
   return dex[normalizeName(speciesName)] || null;
 }
 
-// Locate the Mega forme of a species in the fetched dex, if any.
 function megaFormeEntry(state, speciesName) {
   const dex = state.dexData || {};
   const base = dex[normalizeName(speciesName)];
@@ -165,10 +163,6 @@ function megaFormeEntry(state, speciesName) {
   return forme ? (dex[forme] || null) : null;
 }
 
-// The "~a-b%" chip. atkMon/defMon are state.active entries; opts.teraType and
-// opts.megaForme adjust the attacker for the +Tera / +Mega variants.
-// NOTE: opts must be normalized manually - a default parameter would not
-// apply when callers pass null explicitly.
 function damageChipHtml(state, move, atkMon, defMon, opts) {
   const o = opts || {};
   if (!move || move.category === "Status") return "";
@@ -206,10 +200,6 @@ function damageChipHtml(state, move, atkMon, defMon, opts) {
   return `<span class="chip dmg">~${est.min}-${est.max}%${est.rough ? " \u2248" : ""}</span>`;
 }
 
-// Choice target locations, relative to the choosing player.
-// -1/-2 = foe slots A/B, 1/2 = your slots A/B. "Self" uses the player's own
-// slot number (slot A = 1, slot B = 2), which the sim always accepts for
-// adjacentAllyOrSelf moves.
 function targetLocsFor(moveTarget, slotIdx) {
   const foe = [["-1", "Foe A"], ["-2", "Foe B"]];
   const ally = [["1", "Ally A"], ["2", "Ally B"]];
@@ -530,11 +520,6 @@ function renderIpLockBanner(state) {
 </div>`;
 }
 
-// ---------------------------------------------------------------------------
-// Battle choice UI. Supports singles and doubles. In doubles, picks are made
-// slot by slot: the first pick is stored in the page URL (?part=...) and the
-// final pick submits the joined choice to /choose.
-// ---------------------------------------------------------------------------
 function renderChoices(state, pendingPart) {
   const req = state.request;
   if (!req) return "";
@@ -576,7 +561,6 @@ function renderChoices(state, pendingPart) {
       if (picks.length < total) {
         href = `/battle?part=${encodeURIComponent(picks.join(","))}`;
       } else {
-        // Fill non-forced slots with "pass" and submit.
         const full = [];
         let k = 0;
         for (let s = 0; s < req.forceSwitch.length; s++) {
@@ -617,9 +601,7 @@ function renderChoices(state, pendingPart) {
       }
       return `/battle?part=${encodeURIComponent(picks.join(","))}`;
     };
-    // Resolve which tracked mon a target location points at. Only foe
-    // locations (negative) resolve to a mon - ally/self targets get no
-    // damage chip and fall back to their static label.
+
     const defFor = (loc) => {
       const l = Number(loc);
       if (l < 0) return oppMons[-l - 1] || aliveFoe;
@@ -856,6 +838,8 @@ export function renderTeams(state) {
     body += `<p>Pick a team for <strong>${esc(view.next)}</strong>:</p>`;
   }
 
+  body += `<p><a href="/teams/sync${view.next ? `?next=${encodeURIComponent(view.next)}` : ""}">[&#x21bb; Sync / Import Teams from Showdown Server]</a></p>`;
+
   if (!view.list.length) {
     body += `<p class="muted">No teams stored yet for this account.</p>`;
   }
@@ -911,7 +895,6 @@ export function renderMoveInfo(move, moveId, state) {
       body += `<p>vs ${esc(oppLabel)} [${esc(oppTypes.join("/"))}]: <strong>${esc(
         describeMultiplier(mult)
       )}</strong></p>`;
-      // Approximate damage vs the opponent's first active, using my first active.
       const myInfo = state ? activeForSide(state, "my")[0] : null;
       const chip = damageChipHtml(state, move, myInfo, oppInfo);
       if (chip) {
