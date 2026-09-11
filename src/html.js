@@ -167,7 +167,10 @@ function megaFormeEntry(state, speciesName) {
 
 // The "~a-b%" chip. atkMon/defMon are state.active entries; opts.teraType and
 // opts.megaForme adjust the attacker for the +Tera / +Mega variants.
-function damageChipHtml(state, move, atkMon, defMon, opts = {}) {
+// NOTE: opts must be normalized manually - a default parameter would not
+// apply when callers pass null explicitly.
+function damageChipHtml(state, move, atkMon, defMon, opts) {
+  const o = opts || {};
   if (!move || move.category === "Status") return "";
   if (!atkMon || !defMon || defMon.condition === "0 fnt") return "";
   const atkEntry = dexEntry(state, atkMon.species);
@@ -176,9 +179,9 @@ function damageChipHtml(state, move, atkMon, defMon, opts = {}) {
 
   let types = atkMon.types || [];
   let baseStats = atkEntry.baseStats;
-  if (opts.megaForme) {
-    types = opts.megaForme.types || types;
-    baseStats = opts.megaForme.baseStats || baseStats;
+  if (o.megaForme) {
+    types = o.megaForme.types || types;
+    baseStats = o.megaForme.baseStats || baseStats;
   }
   const defMax =
     parseConditionHp(defMon.condition)?.max ||
@@ -190,7 +193,7 @@ function damageChipHtml(state, move, atkMon, defMon, opts = {}) {
     types,
     boosts: atkMon.boosts || {},
     status: statusFromCondition(atkMon.condition),
-    teraType: opts.teraType || null,
+    teraType: o.teraType || null,
   }, {
     level: defMon.level || 100,
     baseStats: defEntry.baseStats,
@@ -204,7 +207,9 @@ function damageChipHtml(state, move, atkMon, defMon, opts = {}) {
 }
 
 // Choice target locations, relative to the choosing player.
-// -1/-2 = foe slots A/B, 1/2 = your slots A/B, 0 = self.
+// -1/-2 = foe slots A/B, 1/2 = your slots A/B. "Self" uses the player's own
+// slot number (slot A = 1, slot B = 2), which the sim always accepts for
+// adjacentAllyOrSelf moves.
 function targetLocsFor(moveTarget, slotIdx) {
   const foe = [["-1", "Foe A"], ["-2", "Foe B"]];
   const ally = [["1", "Ally A"], ["2", "Ally B"]];
@@ -212,7 +217,9 @@ function targetLocsFor(moveTarget, slotIdx) {
     case "adjacentAlly":
       return slotIdx === 0 ? [["2", "Ally B"]] : [["1", "Ally A"]];
     case "adjacentAllyOrSelf":
-      return slotIdx === 0 ? [["0", "Self"], ["2", "Ally B"]] : [["1", "Ally A"], ["0", "Self"]];
+      return slotIdx === 0
+        ? [["1", "Self"], ["2", "Ally B"]]
+        : [["2", "Self"], ["1", "Ally A"]];
     case "any":
       return [...foe, ...ally];
     case "normal":
@@ -352,7 +359,7 @@ function renderTypeMatchup(state) {
     .filter((p) => p.condition !== "0 fnt")
     .map((p) => {
       const species = (p.details || "").split(",")[0];
-      
+
       const moveTypes = p.moveTypes || [];
       const best = moveTypes.length
         ? Math.max(...moveTypes.map((t) => typeEffectiveness(t, oppTypes)))
@@ -384,7 +391,7 @@ function renderTypeMatchup(state) {
         active: !!p.active,
         best,
         hasMoves: Array.isArray(p.moves) && p.moves.length > 0,
-        defLabel 
+        defLabel
       };
     })
     .sort((a, b) => (b.best ?? -1) - (a.best ?? -1));
@@ -407,7 +414,7 @@ function renderTypeMatchup(state) {
     } else {
       label = `${r.best}x resisted move`;
     }
-    
+
     body += `<div>${r.active ? "&gt; " : ""}${esc(r.species)}: ${esc(label)}${esc(r.defLabel)}</div>`;
   }
   return body;
@@ -610,10 +617,13 @@ function renderChoices(state, pendingPart) {
       }
       return `/battle?part=${encodeURIComponent(picks.join(","))}`;
     };
+    // Resolve which tracked mon a target location points at. Only foe
+    // locations (negative) resolve to a mon - ally/self targets get no
+    // damage chip and fall back to their static label.
     const defFor = (loc) => {
       const l = Number(loc);
-      if (l <= 0) return oppMons[-l - 1] || aliveFoe;
-      return null; // ally/self targets: no damage chip
+      if (l < 0) return oppMons[-l - 1] || aliveFoe;
+      return null;
     };
     const targetLinks = (m, keyword, chipOpts) => {
       const locs = targetLocsFor(m.target || "normal", slotIdx).filter(([loc]) => {
@@ -629,7 +639,7 @@ function renderChoices(state, pendingPart) {
         const d = defFor(loc);
         const monLabel = monTargetLabel(d, baseLabel.replace(/[AB]$/, ""));
         const chip = d && Number(loc) < 0 ? damageChipHtml(state, m, myMon, d, chipOpts) : "";
-        const choice = `move ${moves.indexOf(m) + 1} ${loc}${keyword ? ` ${keyword}` : ""}`;
+        const choice = `move ${moves.indexOf(m) + 1}${loc ? ` ${loc}` : ""}${keyword ? ` ${keyword}` : ""}`;
         const label = monLabel || baseLabel;
         html += `<p class="sub"><a href="${esc(makeHref(choice))}">&rarr; ${esc(label)}${chip ? ` ${chip}` : ""}</a></p>`;
       }
@@ -650,7 +660,7 @@ function renderChoices(state, pendingPart) {
       const needsTarget = doubles && TARGETABLE.includes(m.target || "normal");
       if (needsTarget) {
         body += `<div>${i + 1}. ${esc(m.move)}${typeStr}</div>`;
-        body += targetLinks(m, "", null);
+        body += targetLinks(m, "", {});
       } else {
         const href = makeHref(`move ${i + 1}`);
         const effChip =
@@ -918,7 +928,7 @@ export function renderMoveInfo(move, moveId, state) {
 
 export function renderDex(entry, q) {
   let body = `<h1>Pok&eacute;dex</h1>`;
-  
+
   body += `<form action="/dex" method="get">
 <div><input type="text" name="q" value="${esc(q || "")}" placeholder="Search Pok&eacute;mon"></div>
 <div><input type="submit" value="Search"></div>
@@ -942,9 +952,9 @@ export function renderDex(entry, q) {
     }
     body += `<hr>`;
   }
-  
+
   body += `<p><a href="/battle">Back to battle</a> | <a href="/">Home</a></p>`;
-  
+
   return page(entry ? `Pok&eacute;dex: ${entry.name}` : "Pok&eacute;dex", body);
 }
 
