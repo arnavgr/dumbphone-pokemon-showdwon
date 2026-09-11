@@ -159,6 +159,16 @@ async function getItems() {
   return itemsPromise;
 }
 
+function decodeHtmlEntities(str) {
+  return String(str || "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ");
+}
+
 // ---------------------------------------------------------------------------
 // Team import helpers: support both export text and packed string formats.
 // ---------------------------------------------------------------------------
@@ -372,6 +382,85 @@ async function parseMultipleTeams(text) {
   }];
 }
 
+async function fetchTeamBySlug(slug, nameHint, headers, dispatcher) {
+  let html = "";
+  try {
+    const body = new URLSearchParams();
+    body.set("act", "requestpage");
+    body.set("page", `team-${slug}`);
+    if (headers.assertion) body.set("assertion", headers.assertion);
+    const res = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent": "ps-cloudphone",
+        "Origin": "https://play.pokemonshowdown.com",
+        "Referer": "https://play.pokemonshowdown.com/",
+        ...(headers.cookie ? { Cookie: headers.cookie } : {}),
+      },
+      body: body.toString(),
+      dispatcher,
+    });
+    if (res.ok) html = await res.text();
+  } catch {}
+
+  if (!html || (!html.includes("<textarea") && !html.includes("<pre") && !html.includes("/utm") && !html.includes("Ability:"))) {
+    try {
+      const res = await undiciFetch(`https://psim.us/t/${slug}`, {
+        headers: {
+          "User-Agent": "ps-cloudphone",
+          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
+        },
+        dispatcher,
+      });
+      if (res.ok) html = await res.text();
+    } catch {}
+  }
+
+  if (!html) return null;
+
+  let title = nameHint || "";
+  if (!title) {
+    const tm = html.match(/<h[1-4][^>]*>([^<]+)<\/h[1-4]>/i) || html.match(/<title>([^<]+)<\/title>/i);
+    if (tm) {
+      title = tm[1]
+        .replace(/-(?:Pok[eé]mon Showdown|Showdown).*$/i, "")
+        .replace(/\s*\((?:Private|Public)\)/i, "")
+        .trim();
+    }
+  }
+
+  let teamContent = "";
+  const textMatch = html.match(/<(?:textarea|pre|code)[^>]*>([\s\S]*?)<\/(?:textarea|pre|code)>/i);
+  if (textMatch) {
+    teamContent = decodeHtmlEntities(textMatch[1]).trim();
+  } else {
+    const utmMatch = html.match(/value="\/utm\s+([^"]+)"/i) || html.match(/\/utm\s+([a-zA-Z0-9_|\]]+)/i);
+    if (utmMatch) {
+      teamContent = utmMatch[1].trim();
+    }
+  }
+
+  if (!teamContent && (html.includes("Ability:") || html.includes("@"))) {
+    teamContent = cleanRawHtml(html);
+  }
+
+  if (!teamContent) return null;
+
+  try {
+    const parsed = await parseAnyTeam(teamContent);
+    return {
+      name: title || `Team (${slug})`,
+      packed: parsed.packed,
+      summary: parsed.summary,
+      count: parsed.count,
+      added: Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function cleanSideCond(s) {
   return String(s || "").replace(/^move:\s*/i, "").trim();
 }
@@ -401,6 +490,7 @@ const DEFAULT_STATE = {
   notice: null,
   loginError: null,
   serverMsg: null,
+  assertion: null,
   upstreamCookie: null,
   challengesFrom: {},
   challengeTo: null,
@@ -436,7 +526,6 @@ export class BattleSession {
     this.consecutiveQuickDrops = 0;
     this._dropHandled = false;
     this._messageQueue = Promise.resolve();
-    this._syncListener = null;
   }
 
   pushLog(line) {
@@ -686,6 +775,21 @@ export class BattleSession {
       dispatcher: proxyDispatcher,
     });
 
+    let sidCookie = null;
+    const rawSetCookies = typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : [res.headers.get("set-cookie")].filter(Boolean);
+    for (const c of rawSetCookies) {
+      const m = String(c || "").match(/(sid=[^;]+)/i);
+      if (m) {
+        sidCookie = m[1];
+        break;
+      }
+    }
+    if (sidCookie) {
+      this.state_.upstreamCookie = sidCookie;
+    }
+
     const text = await res.text();
     let jsonText = text.trim();
     if (jsonText.startsWith("]")) jsonText = jsonText.slice(1);
@@ -721,6 +825,7 @@ export class BattleSession {
       return this._doLogin(username, password, true);
     }
 
+    this.state_.assertion = assertion;
     const finalName = action?.username || username;
 
     let confirmResolve;
@@ -749,12 +854,6 @@ export class BattleSession {
     this.state_.loginError = null;
     this.relogDisabled = false;
     this.state_.notice = `Logged in as ${finalName}.`;
-
-    // Attempt background sync if this account has no local teams stored yet
-    const normUser = normalizeName(finalName);
-    if (!teamsStore[normUser] || !teamsStore[normUser].length) {
-      this.syncTeamsFromServer().catch(() => {});
-    }
   }
 
   async autoRelogin() {
@@ -766,7 +865,9 @@ export class BattleSession {
       this.state_.loggedIn &&
       this.ws &&
       this.ws.readyState === 1 &&
-      this.state_.username?.toLowerCase() === loginName.toLowerCase();
+      this.state_.username?.toLowerCase() === loginName.toLowerCase() &&
+      this.state_.upstreamCookie &&
+      this.state_.assertion;
 
     if (alreadyIn()) return;
 
@@ -823,17 +924,9 @@ export class BattleSession {
     ws.on("message", (data) => {
       const text = data.toString();
       const { roomId, lines } = splitFrame(text);
-      const combinedLines = [];
-      for (const line of lines) {
-        if (!line.startsWith("|") && combinedLines.length > 0) {
-          combinedLines[combinedLines.length - 1] += "\n" + line;
-        } else {
-          combinedLines.push(line);
-        }
-      }
       this._messageQueue = this._messageQueue
         .then(async () => {
-          for (const rawLine of combinedLines) {
+          for (const rawLine of lines) {
             await this.handleLine(roomId, rawLine);
           }
         })
@@ -930,113 +1023,136 @@ export class BattleSession {
     return picked ? { team: picked, idx: pickedIdx } : null;
   }
 
-  async syncTeamsFromServer(timeoutMs = 5000) {
+  async syncTeamsFromServer() {
     const user = normalizeName(this.state_.loginName || "");
     if (!user) throw new Error("Log in first to sync server teams.");
 
     const discoveredTeams = [];
-    const pendingExports = new Set();
-    let receivedAnyResponse = false;
-    let serverFeedback = null;
+    const headers = {
+      cookie: this.state_.upstreamCookie || "",
+      assertion: this.state_.assertion || "",
+    };
 
-    const listener = async (type, parts) => {
-      if (type === "uhtml" || type === "uhtmlchange") {
-        receivedAnyResponse = true;
-        const uhtmlContent = parts.slice(1).join("|");
+    // 1. Check act=getteams endpoint
+    try {
+      const getRes = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php?act=getteams", {
+        method: "GET",
+        headers: {
+          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
+          "User-Agent": "ps-cloudphone",
+        },
+        dispatcher: proxyDispatcher,
+      });
 
-        if (/no teams/i.test(uhtmlContent)) {
-          serverFeedback = "No teams stored on Pokémon Showdown server for this account.";
-          return;
-        }
-
-        const utmMatches = [...uhtmlContent.matchAll(/value="\/utm\s+([^"]+)"/gi)];
-        for (const m of utmMatches) {
+      if (getRes.ok) {
+        let text = await getRes.text();
+        if (text) {
+          if (text.startsWith("]")) text = text.slice(1).trim();
           try {
-            const parsed = await parseAnyTeam(m[1]);
-            discoveredTeams.push({
-              name: `Server Team ${discoveredTeams.length + 1}`,
-              packed: parsed.packed,
-              summary: parsed.summary,
-              count: parsed.count,
-              added: Date.now(),
-            });
-          } catch {}
-        }
-
-        const exportMatches = [
-          ...uhtmlContent.matchAll(/value="\/team\s+(?:export|view)\s+([^"]+)"/gi),
-        ];
-        for (const em of exportMatches) {
-          let tName = em[1]
-            .replace(/&quot;/g, '"')
-            .replace(/&#39;/g, "'")
-            .replace(/&amp;/g, "&")
-            .trim();
-          tName = tName.replace(/^["']|["']$/g, "").trim();
-          if (tName && !pendingExports.has(tName)) {
-            pendingExports.add(tName);
+            const data = JSON.parse(text);
+            const teamArr = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : []);
+            for (const item of teamArr) {
+              if (typeof item === "string") {
+                const parsed = await parseAnyTeam(item);
+                discoveredTeams.push({
+                  name: `Server Team ${discoveredTeams.length + 1}`,
+                  packed: parsed.packed,
+                  summary: parsed.summary,
+                  count: parsed.count,
+                  added: Date.now(),
+                });
+              } else if (item && typeof item === "object") {
+                const teamContent = item.team || item.packed || item.data || "";
+                if (teamContent) {
+                  const parsed = await parseAnyTeam(teamContent);
+                  discoveredTeams.push({
+                    name: item.name || item.title || `Server Team ${discoveredTeams.length + 1}`,
+                    packed: parsed.packed,
+                    summary: parsed.summary,
+                    count: parsed.count,
+                    added: Date.now(),
+                  });
+                }
+              }
+            }
+          } catch {
             try {
-              this.send(`|/team export ${tName}`);
+              const parsedList = await parseMultipleTeams(text);
+              for (const pt of parsedList) discoveredTeams.push(pt);
             } catch {}
           }
         }
-
-        const preMatches = [...uhtmlContent.matchAll(/<(?:pre|textarea)[^>]*>([\s\S]*?)<\/(?:pre|textarea)>/gi)];
-        for (const pm of preMatches) {
-          const block = pm[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").trim();
-          try {
-            const parsedList = await parseMultipleTeams(block);
-            for (const pt of parsedList) discoveredTeams.push(pt);
-          } catch {}
-        }
       }
+    } catch {}
 
-      if (type === "popup" || type === "html" || type === "raw" || type === "queryresponse") {
-        const content = parts.join("|");
-        if (/no teams/i.test(content)) {
-          serverFeedback = "No teams stored on Pokémon Showdown server for this account.";
-          return;
-        }
-        if (
-          content.includes("Ability:") ||
-          content.includes("===") ||
-          (content.includes("|") && (content.includes("]") || content.split("|").length >= 6))
-        ) {
-          receivedAnyResponse = true;
-          try {
-            const parsedList = await parseMultipleTeams(content);
-            for (const pt of parsedList) {
-              discoveredTeams.push(pt);
-            }
-          } catch {}
-        }
-      }
-    };
-
-    this._syncListener = listener;
-
+    // 2. Request teams list page room: page=teams-all-
+    let pageResText = "";
     try {
-      this.send("|/teams");
-      this.send("|/team list");
+      const pageBody = new URLSearchParams();
+      pageBody.set("act", "requestpage");
+      pageBody.set("page", "teams-all-");
+      if (headers.assertion) pageBody.set("assertion", headers.assertion);
 
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline) {
-        if (discoveredTeams.length > 0 && pendingExports.size > 0 && discoveredTeams.length >= pendingExports.size) {
-          break;
-        }
-        if (serverFeedback) break;
-        await new Promise((r) => setTimeout(r, 200));
+      const pageRes = await undiciFetch("https://play.pokemonshowdown.com/~~showdown/action.php", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "User-Agent": "ps-cloudphone",
+          "Origin": "https://play.pokemonshowdown.com",
+          "Referer": "https://play.pokemonshowdown.com/",
+          "X-Requested-With": "XMLHttpRequest",
+          ...(headers.cookie ? { Cookie: headers.cookie } : {}),
+        },
+        body: pageBody.toString(),
+        dispatcher: proxyDispatcher,
+      });
+
+      if (pageRes.ok) {
+        pageResText = await pageRes.text();
       }
-    } finally {
-      this._syncListener = null;
+    } catch {}
+
+    if (pageResText) {
+      const slugMap = new Map();
+
+      // Match title alongside slug: Title (Private)...psim.us/t/slug
+      const titledMatches = [
+        ...pageResText.matchAll(/([^<>\n\r]+?)\s*\((?:Private|Public)\)[\s\S]*?(?:psim\.us\/t\/|view-team-)([0-9]+-[a-zA-Z0-9_-]+)/gi)
+      ];
+      for (const tm of titledMatches) {
+        const title = tm[1].trim();
+        const slug = tm[2].trim();
+        if (slug && !slugMap.has(slug)) {
+          slugMap.set(slug, title);
+        }
+      }
+
+      // Match standalone slugs
+      const standaloneSlugs = [
+        ...pageResText.matchAll(/(?:psim\.us\/t\/|view-team-|\/t\/)([0-9]+-[a-zA-Z0-9_-]+)/gi)
+      ];
+      for (const sm of standaloneSlugs) {
+        const slug = sm[1].trim();
+        if (slug && !slugMap.has(slug)) {
+          slugMap.set(slug, "");
+        }
+      }
+
+      // Fetch each team slug
+      for (const [slug, nameHint] of slugMap.entries()) {
+        if (discoveredTeams.length >= 12) break;
+        const fetchedTeam = await fetchTeamBySlug(slug, nameHint, headers, proxyDispatcher);
+        if (fetchedTeam) {
+          discoveredTeams.push(fetchedTeam);
+        }
+      }
     }
 
     if (!discoveredTeams.length) {
-      if (serverFeedback) throw new Error(serverFeedback);
-      if (!receivedAnyResponse) {
-        throw new Error("No response from Pokémon Showdown server. Please check your connection.");
+      if (/no teams/i.test(pageResText) || pageResText.includes("0 teams")) {
+        throw new Error("No teams found on Pokémon Showdown server for this account.");
       }
-      throw new Error("No teams found on Pokémon Showdown server for this account.");
+      throw new Error("Could not retrieve teams from Pokémon Showdown server. Please ensure you are logged in.");
     }
 
     const list = teamsStore[user] || (teamsStore[user] = []);
@@ -1059,12 +1175,6 @@ export class BattleSession {
     const mySide = this.state_.mySide;
     const inBattle = roomId && roomId === this.state_.roomId && roomId.startsWith("battle-");
 
-    if (this._syncListener) {
-      try {
-        await this._syncListener(type, parts, rawLine);
-      } catch {}
-    }
-
     if (roomId && roomId.startsWith("help-")) {
       try { this.sendToRoom(roomId, "/leave"); } catch {}
     }
@@ -1076,11 +1186,6 @@ export class BattleSession {
         if (text && inBattle) {
           this.pushChat(`[info] ${text}`);
         }
-        break;
-      }
-
-      case "uhtml":
-      case "uhtmlchange": {
         break;
       }
 
@@ -1144,9 +1249,6 @@ export class BattleSession {
       case "warning": {
         const msg = cleanRawHtml(parts.join("|"));
         if (msg) {
-          if (this._syncListener && (msg.includes("Ability:") || msg.includes("==="))) {
-            break;
-          }
           this.state_.serverMsg = msg;
           this.pushLog(`[server] ${msg}`);
           if (this.loginConfirmResolve && /signature|assertion|authentication|token/i.test(msg)) {
@@ -1846,7 +1948,10 @@ export class BattleSession {
         }
         const next = String(req.query.next || this.state_.teamNext || "");
         try {
-          if (this.state_.loginName) {
+          if (this.state_.loginName && this.state_.loginPassword && (!this.state_.upstreamCookie || !this.state_.assertion)) {
+            this.relogDisabled = false;
+            await this.login(this.state_.loginName, this.state_.loginPassword);
+          } else if (this.state_.loginName) {
             await this.autoRelogin();
           }
           const resSync = await this.syncTeamsFromServer();
